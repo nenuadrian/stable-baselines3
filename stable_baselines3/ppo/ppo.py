@@ -198,7 +198,10 @@ class PPO(OnPolicyAlgorithm):
         entropy_losses = []
         pg_losses, value_losses = [], []
         clip_fractions = []
-
+        batch_advantages = []
+        batch_norm_advantages = []
+        ratios = []
+        grad_norms = []
         continue_training = True
         # train for n_epochs epochs
         for epoch in range(self.n_epochs):
@@ -214,13 +217,15 @@ class PPO(OnPolicyAlgorithm):
                 values = values.flatten()
                 # Normalize advantage
                 advantages = rollout_data.advantages
+                batch_advantages.append(advantages.cpu().numpy())
+
                 # Normalization does not make sense if mini batchsize == 1, see GH issue #325
                 if self.normalize_advantage and len(advantages) > 1:
                     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
+                    batch_norm_advantages.append(advantages.cpu().numpy())
                 # ratio between old and new policy, should be one at the first iteration
                 ratio = th.exp(log_prob - rollout_data.old_log_prob)
-
+                ratios.append(ratio.detach().cpu().numpy())
                 # clipped surrogate loss
                 policy_loss_1 = advantages * ratio
                 policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
@@ -274,7 +279,7 @@ class PPO(OnPolicyAlgorithm):
                 self.policy.optimizer.zero_grad()
                 loss.backward()
                 # Clip grad norm
-                th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                grad_norms.append(th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm))
                 self.policy.optimizer.step()
 
             self._n_updates += 1
@@ -284,6 +289,13 @@ class PPO(OnPolicyAlgorithm):
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
         # Logs
+        self.logger.record("train/ratios_mean", np.mean(ratios))
+        if len(batch_advantages) > 0:
+            self.logger.record("train/advantages_mean", np.mean(batch_advantages))
+            self.logger.record("train/advantages_sum", np.sum(batch_advantages))
+        if len(batch_norm_advantages) > 0:
+            self.logger.record("train/advantages_norm_mean", np.mean(batch_norm_advantages))
+            self.logger.record("train/advantages_norm_sum", np.sum(batch_norm_advantages))
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
         self.logger.record("train/value_loss", np.mean(value_losses))
@@ -291,6 +303,9 @@ class PPO(OnPolicyAlgorithm):
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())
         self.logger.record("train/explained_variance", explained_var)
+        if len(grad_norms) > 0:
+            self.logger.record("train/grad_norm", np.mean(grad_norms))
+            self.logger.record("train/grad_norm/max", np.max(grad_norms))
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
 
