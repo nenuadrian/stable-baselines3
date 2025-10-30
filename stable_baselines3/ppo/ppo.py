@@ -281,7 +281,7 @@ class PPO(OnPolicyAlgorithm):
                 self.policy.optimizer.zero_grad()
                 loss.backward()
                 # Clip grad norm
-                grad_norms.append(th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm))
+                grad_norms.append(th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm).cpu().numpy())
                 self.policy.optimizer.step()
 
             self._n_updates += 1
