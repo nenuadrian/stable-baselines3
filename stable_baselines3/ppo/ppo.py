@@ -104,6 +104,7 @@ class PPO(OnPolicyAlgorithm):
         verbose: int = 0,
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
+        advantage_multiplier: float = 1.0,
         _init_setup_model: bool = True,
     ):
         super().__init__(
@@ -160,6 +161,7 @@ class PPO(OnPolicyAlgorithm):
                     f"We recommend using a `batch_size` that is a factor of `n_steps * n_envs`.\n"
                     f"Info: (n_steps={self.n_steps} and n_envs={self.env.num_envs})"
                 )
+        self.advantage_multiplier = advantage_multiplier
         self.batch_size = batch_size
         self.n_epochs = n_epochs
         self.clip_range = clip_range
@@ -216,7 +218,7 @@ class PPO(OnPolicyAlgorithm):
                 values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
                 values = values.flatten()
                 # Normalize advantage
-                advantages = rollout_data.advantages
+                advantages = rollout_data.advantages * self.advantage_multiplier
                 batch_advantages.append(advantages.cpu().numpy())
 
                 # Normalization does not make sense if mini batchsize == 1, see GH issue #325
