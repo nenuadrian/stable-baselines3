@@ -218,13 +218,15 @@ class PPO(OnPolicyAlgorithm):
                 values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
                 values = values.flatten()
                 # Normalize advantage
-                advantages = rollout_data.advantages * self.advantage_multiplier
+                advantages = rollout_data.advantages
                 batch_advantages.append(advantages.cpu().numpy())
 
                 # Normalization does not make sense if mini batchsize == 1, see GH issue #325
                 if self.normalize_advantage and len(advantages) > 1:
                     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
                     batch_norm_advantages.append(advantages.cpu().numpy())
+                    
+                advantages = advantages * self.advantage_multiplier
                 # ratio between old and new policy, should be one at the first iteration
                 ratio = th.exp(log_prob - rollout_data.old_log_prob)
                 ratios.append(ratio.detach().cpu().numpy())
