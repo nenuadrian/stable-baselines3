@@ -105,6 +105,7 @@ class PPO(OnPolicyAlgorithm):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         advantage_multiplier: float = 1.0,
+        normalize_advantage_mean: bool = True,
         _init_setup_model: bool = True,
     ):
         super().__init__(
@@ -162,6 +163,7 @@ class PPO(OnPolicyAlgorithm):
                     f"Info: (n_steps={self.n_steps} and n_envs={self.env.num_envs})"
                 )
         self.advantage_multiplier = advantage_multiplier
+        self.normalize_advantage_mean = normalize_advantage_mean
         self.batch_size = batch_size
         self.n_epochs = n_epochs
         self.clip_range = clip_range
@@ -223,9 +225,12 @@ class PPO(OnPolicyAlgorithm):
 
                 # Normalization does not make sense if mini batchsize == 1, see GH issue #325
                 if self.normalize_advantage and len(advantages) > 1:
-                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                    if self.normalize_advantage_mean:
+                        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                    else:
+                        advantages = advantages / (advantages.std() + 1e-8)
                     batch_norm_advantages.append(advantages.cpu().numpy())
-                    
+
                 advantages = advantages * self.advantage_multiplier
                 # ratio between old and new policy, should be one at the first iteration
                 ratio = th.exp(log_prob - rollout_data.old_log_prob)
