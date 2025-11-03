@@ -68,6 +68,9 @@ class PPO(OnPolicyAlgorithm):
     :param seed: Seed for the pseudo random generators
     :param device: Device (cpu, cuda, ...) on which the code should be run.
         Setting it to auto, the code will be run on the GPU if possible.
+    :param separate_optimizers: If True, use two optimizers to update actor and critic separately
+        (hyperparameters identical). Shared feature extractor (if any) is updated once using
+        the combined gradients from both losses.
     :param _init_setup_model: Whether or not to build the network at the creation of the instance
     """
 
@@ -106,6 +109,7 @@ class PPO(OnPolicyAlgorithm):
         device: Union[th.device, str] = "auto",
         advantage_multiplier: float = 1.0,
         normalize_advantage_mean: bool = True,
+        separate_optimizers: bool = False,
         _init_setup_model: bool = True,
     ):
         super().__init__(
@@ -170,6 +174,13 @@ class PPO(OnPolicyAlgorithm):
         self.clip_range_vf = clip_range_vf
         self.normalize_advantage = normalize_advantage
         self.target_kl = target_kl
+        self.separate_optimizers = separate_optimizers
+
+        # Split-optimizer related attributes
+        self.actor_optimizer: Optional[th.optim.Optimizer] = None
+        self.critic_optimizer: Optional[th.optim.Optimizer] = None
+        self._actor_params: Optional[list[th.nn.Parameter]] = None
+        self._critic_params: Optional[list[th.nn.Parameter]] = None
 
         if _init_setup_model:
             self._setup_model()
@@ -185,6 +196,45 @@ class PPO(OnPolicyAlgorithm):
 
             self.clip_range_vf = FloatSchedule(self.clip_range_vf)
 
+        # When requested, build two optimizers with separated parameter groups
+        if self.separate_optimizers:
+            # Helpers to collect unique parameters
+            def _extend_unique(dst: list[th.nn.Parameter], params_iter) -> None:
+                seen = {id(p) for p in dst}
+                for p in params_iter:
+                    if id(p) not in seen:
+                        dst.append(p)
+                        seen.add(id(p))
+
+            actor_params: list[th.nn.Parameter] = []
+            critic_params: list[th.nn.Parameter] = []
+
+            # Actor-specific modules
+            _extend_unique(actor_params, self.policy.mlp_extractor.policy_net.parameters())
+            _extend_unique(actor_params, self.policy.action_net.parameters())
+            if hasattr(self.policy, "log_std") and isinstance(self.policy.log_std, th.nn.Parameter):
+                actor_params.append(self.policy.log_std)
+
+            # Critic-specific modules
+            _extend_unique(critic_params, self.policy.mlp_extractor.value_net.parameters())
+            _extend_unique(critic_params, self.policy.value_net.parameters())
+
+            # Feature extractors: shared or separate
+            if getattr(self.policy, "share_features_extractor", True):
+                _extend_unique(actor_params, self.policy.features_extractor.parameters())
+            else:
+                _extend_unique(actor_params, self.policy.pi_features_extractor.parameters())
+                _extend_unique(critic_params, self.policy.vf_features_extractor.parameters())
+
+            # Save param lists for clipping/logging
+            self._actor_params = actor_params
+            self._critic_params = critic_params
+
+            # Create optimizers mirroring policy optimizer hyperparameters
+            initial_lr = self.lr_schedule(1)
+            self.actor_optimizer = self.policy.optimizer_class(self._actor_params, lr=initial_lr, **self.policy.optimizer_kwargs)  # type: ignore[arg-type]
+            self.critic_optimizer = self.policy.optimizer_class(self._critic_params, lr=initial_lr, **self.policy.optimizer_kwargs)  # type: ignore[arg-type]
+
     def train(self) -> None:
         """
         Update policy using the currently gathered rollout buffer.
@@ -192,7 +242,11 @@ class PPO(OnPolicyAlgorithm):
         # Switch to train mode (this affects batch norm / dropout)
         self.policy.set_training_mode(True)
         # Update optimizer learning rate
-        self._update_learning_rate(self.policy.optimizer)
+        if self.separate_optimizers:
+            assert self.actor_optimizer is not None and self.critic_optimizer is not None
+            self._update_learning_rate([self.actor_optimizer, self.critic_optimizer])
+        else:
+            self._update_learning_rate(self.policy.optimizer)
         # Compute current clip range
         clip_range = self.clip_range(self._current_progress_remaining)  # type: ignore[operator]
         # Optional: clip range for the value function
@@ -206,6 +260,8 @@ class PPO(OnPolicyAlgorithm):
         batch_norm_advantages = []
         ratios = []
         grad_norms = []
+        actor_grad_norms: list[np.ndarray] = []
+        critic_grad_norms: list[np.ndarray] = []
         continue_training = True
         # train for n_epochs epochs
         for epoch in range(self.n_epochs):
@@ -267,7 +323,7 @@ class PPO(OnPolicyAlgorithm):
 
                 entropy_losses.append(entropy_loss.item())
 
-                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+                combined_loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
 
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
@@ -285,11 +341,41 @@ class PPO(OnPolicyAlgorithm):
                     break
 
                 # Optimization step
-                self.policy.optimizer.zero_grad()
-                loss.backward()
-                # Clip grad norm
-                grad_norms.append(th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm).cpu().numpy())
-                self.policy.optimizer.step()
+                if self.separate_optimizers:
+                    assert self.actor_optimizer is not None and self.critic_optimizer is not None
+                    assert self._actor_params is not None and self._critic_params is not None
+
+                    # Zero-grad both optimizers
+                    self.actor_optimizer.zero_grad()
+                    self.critic_optimizer.zero_grad()
+
+                    # Backward actor then critic
+                    actor_loss = policy_loss + self.ent_coef * entropy_loss
+                    actor_loss.backward(retain_graph=True)
+                    critic_loss = self.vf_coef * value_loss
+                    critic_loss.backward()
+
+                    # Clip and step actor (includes shared params)
+                    actor_grad_norms.append(
+                        th.nn.utils.clip_grad_norm_(self._actor_params, self.max_grad_norm).cpu().numpy()
+                    )
+                    self.actor_optimizer.step()
+
+                    # Clip and step critic (critic-only params)
+                    critic_grad_norms.append(
+                        th.nn.utils.clip_grad_norm_(self._critic_params, self.max_grad_norm).cpu().numpy()
+                    )
+                    self.critic_optimizer.step()
+                    # For compatibility with later logging
+                    loss = combined_loss
+                else:
+                    self.policy.optimizer.zero_grad()
+                    combined_loss.backward()
+                    # Clip grad norm
+                    grad_norms.append(
+                        th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm).cpu().numpy()
+                    )
+                    self.policy.optimizer.step()
 
             self._n_updates += 1
             if not continue_training:
@@ -310,8 +396,16 @@ class PPO(OnPolicyAlgorithm):
         self.logger.record("train/value_loss", np.mean(value_losses))
         self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
-        self.logger.record("train/loss", loss.item())
+        # Record last combined loss value
+        self.logger.record("train/loss", combined_loss.item())
         self.logger.record("train/explained_variance", explained_var)
+        # Grad norm logging
+        if len(actor_grad_norms) > 0:
+            self.logger.record("train/grad_norm_actor", np.mean(actor_grad_norms))
+            self.logger.record("train/grad_norm_actor/max", np.max(actor_grad_norms))
+        if len(critic_grad_norms) > 0:
+            self.logger.record("train/grad_norm_critic", np.mean(critic_grad_norms))
+            self.logger.record("train/grad_norm_critic/max", np.max(critic_grad_norms))
         if len(grad_norms) > 0:
             self.logger.record("train/grad_norm", np.mean(grad_norms))
             self.logger.record("train/grad_norm/max", np.max(grad_norms))
@@ -322,6 +416,15 @@ class PPO(OnPolicyAlgorithm):
         self.logger.record("train/clip_range", clip_range)
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
+
+    def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
+        """
+        Include separate optimizers in state dicts when enabled.
+        """
+        if self.separate_optimizers:
+            return ["policy", "policy.optimizer", "actor_optimizer", "critic_optimizer"], []
+        # Default behavior from parent
+        return super()._get_torch_save_params()
 
     def learn(
         self: SelfPPO,
