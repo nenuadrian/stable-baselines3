@@ -207,9 +207,9 @@ class PPO(OnPolicyAlgorithm):
         ratios = []
         grad_norms = []
         continue_training = True
+        approx_kl_divs = []
         # train for n_epochs epochs
         for epoch in range(self.n_epochs):
-            approx_kl_divs = []
             # Do a complete pass on the rollout buffer
             for rollout_data in self.rollout_buffer.get(self.batch_size):
                 actions = rollout_data.actions
