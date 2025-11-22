@@ -11,6 +11,7 @@ from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.policies import ActorCriticCnnPolicy, ActorCriticPolicy, BasePolicy, MultiInputActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import FloatSchedule, explained_variance
+from stable_baselines3.ppo._score_adam import ScoreAdam
 
 SelfPPO = TypeVar("SelfPPO", bound="PPO")
 
@@ -109,7 +110,8 @@ class PPO(OnPolicyAlgorithm):
         device: Union[th.device, str] = "auto",
         advantage_multiplier: float = 1.0,
         normalize_advantage_mean: bool = True,
-        separate_optimizers: bool = False,
+        normalize_advantage_std: bool = True,
+        separate_optimizers: bool = True,
         _init_setup_model: bool = True,
     ):
         super().__init__(
@@ -168,6 +170,7 @@ class PPO(OnPolicyAlgorithm):
                 )
         self.advantage_multiplier = advantage_multiplier
         self.normalize_advantage_mean = normalize_advantage_mean
+        self.normalize_advantage_std = normalize_advantage_std
         self.batch_size = batch_size
         self.n_epochs = n_epochs
         self.clip_range = clip_range
@@ -280,12 +283,14 @@ class PPO(OnPolicyAlgorithm):
                 batch_advantages.append(advantages.cpu().numpy())
 
                 # Normalization does not make sense if mini batchsize == 1, see GH issue #325
-                if self.normalize_advantage and len(advantages) > 1:
-                    if self.normalize_advantage_mean:
-                        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                    else:
-                        advantages = advantages / (advantages.std() + 1e-8)
-                    batch_norm_advantages.append(advantages.cpu().numpy())
+                if self.normalize_advantage and len(advantages) > 1:                    # Apply mean and/or std normalization based on switches
+                    # If both switches are False, keep advantages as-is
+                    if self.normalize_advantage_mean or self.normalize_advantage_std:
+                        if self.normalize_advantage_mean:
+                            advantages = advantages - advantages.mean()
+                        if self.normalize_advantage_std:
+                            advantages = advantages / (advantages.std() + 1e-8)
+                        batch_norm_advantages.append(advantages.cpu().numpy())
 
                 advantages = advantages * self.advantage_multiplier
                 # ratio between old and new policy, should be one at the first iteration
@@ -295,6 +300,15 @@ class PPO(OnPolicyAlgorithm):
                 policy_loss_1 = advantages * ratio
                 policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
                 policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
+
+                # For score-only loss used by ScoreAdam, we need to know which samples are
+                # clipped according to the *original* PPO objective (that depends on advantage
+                # sign and magnitude). We record this mask once using the true losses.
+                with th.no_grad():
+                    # True PPO uses the min between the unclipped and clipped objectives
+                    # (for each sample). Wherever policy_loss_2 < policy_loss_1, the clipped
+                    # objective is active.
+                    use_clipped_mask = policy_loss_2 < policy_loss_1
 
                 # Logging
                 pg_losses.append(policy_loss.item())
@@ -344,6 +358,29 @@ class PPO(OnPolicyAlgorithm):
                         print(f"Early stopping at step {epoch} due to reaching max kl: {approx_kl_div:.2f}")
                     break
 
+                # Optional: compute score-only gradients (∇ log π and ratio/clip structure,
+                # but without advantage scaling) for ScoreAdam. We re-use the clipping
+                # decision from the true PPO objective via `use_clipped_mask`.
+                score_grads_dict: Optional[dict[int, th.Tensor]] = None
+                if self.separate_optimizers and isinstance(self.actor_optimizer, ScoreAdam):
+                    assert self._actor_params is not None
+                    # Build an "actor score loss" that mirrors the PPO clipping decision
+                    # (via use_clipped_mask), but without scaling by the advantages.
+                    score_unclipped = ratio
+                    score_clipped = th.clamp(ratio, 1 - clip_range, 1 + clip_range)
+                    # For samples where PPO would use the clipped objective, we use
+                    # the clipped ratio; otherwise, we use the unclipped ratio.
+                    score_objective = th.where(use_clipped_mask, score_clipped, score_unclipped)
+                    policy_score_loss = -score_objective.mean()
+                    actor_score_loss = policy_score_loss + self.ent_coef * entropy_loss
+
+                    score_grads = th.autograd.grad(
+                        actor_score_loss, self._actor_params, retain_graph=True, allow_unused=True
+                    )
+                    score_grads_dict = {
+                        id(p): g for p, g in zip(self._actor_params, score_grads) if g is not None
+                    }
+
                 # Optimization step
                 if self.separate_optimizers:
                     assert self.actor_optimizer is not None and self.critic_optimizer is not None
@@ -363,7 +400,12 @@ class PPO(OnPolicyAlgorithm):
                     actor_grad_norms.append(
                         th.nn.utils.clip_grad_norm_(self._actor_params, self.max_grad_norm).cpu().numpy()
                     )
-                    self.actor_optimizer.step()
+                    if isinstance(self.actor_optimizer, ScoreAdam):
+                        # Pass score-only gradients so that the denominator in Adam
+                        # only depends on score-related terms, not on the advantage.
+                        self.actor_optimizer.step(score_grads=score_grads_dict)
+                    else:
+                        self.actor_optimizer.step()
 
                     # Clip and step critic (critic-only params)
                     critic_grad_norms.append(
