@@ -337,7 +337,7 @@ class VMPO(OnPolicyAlgorithm):
                 if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
                     continue_training = False
 
-                if epoch == range(self.n_epochs) - 1 or not continue_training:
+                if epoch == self.n_epochs - 1 or not continue_training:
                     with th.no_grad():
                         log_ratio = log_prob - rollout_data.old_log_prob
                         approx_kl_div = th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
