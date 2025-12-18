@@ -291,6 +291,15 @@ class VMPO(OnPolicyAlgorithm):
                 policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
                 policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
 
+                # For score-only loss used by ScoreAdam, we need to know which samples are
+                # clipped according to the *original* PPO objective (that depends on advantage
+                # sign and magnitude). We record this mask once using the true losses.
+                with th.no_grad():
+                    # True PPO uses the min between the unclipped and clipped objectives
+                    # (for each sample). Wherever policy_loss_2 < policy_loss_1, the clipped
+                    # objective is active.
+                    use_clipped_mask = policy_loss_2 < policy_loss_1
+
                 # Logging
                 pg_losses.append(policy_loss.item())
                 clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
