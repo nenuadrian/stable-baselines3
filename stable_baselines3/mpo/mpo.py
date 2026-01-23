@@ -1,3 +1,19 @@
+"""
+MPO-style implementation for Stable-Baselines3.
+
+This file implements a *Maximum a Posteriori Policy Optimisation (MPO)*-like update:
+  - E-step: sample actions from a target policy and compute nonparametric weights via a
+    temperature-constrained softmax over Q-values.
+  - M-step: update the online Gaussian policy by minimizing a weighted cross-entropy subject to
+    KL constraints (mean/stddev), enforced via dual variables (alphas).
+
+Integration note:
+  - Rollouts are collected via SB3's OnPolicyAlgorithm, then converted into an off-policy replay
+    buffer that MPO-style updates sample from.
+Limitations:
+  - Currently supports Box observation/action spaces only, with an MLP critic over flattened obs.
+"""
+
 from typing import Any, ClassVar, Optional, TypeVar, Union
 
 import numpy as np
@@ -227,52 +243,15 @@ class QNetwork(nn.Module):
 
 class MPO(OnPolicyAlgorithm):
     """
-    :param policy: The policy model to use (MlpPolicy, CnnPolicy, ...)
-    :param env: The environment to learn from (if registered in Gym, can be str)
-    :param learning_rate: The learning rate, it can be a function
-        of the current progress remaining (from 1 to 0)
-    :param n_steps: The number of steps to run for each environment per update
-        (i.e. rollout buffer size is n_steps * n_envs where n_envs is number of environment copies running in parallel)
-        NOTE: n_steps * n_envs must be greater than 1 (because of the advantage normalization)
-        See https://github.com/pytorch/pytorch/issues/29372
-    :param batch_size: Minibatch size
-    :param n_epochs: Number of epoch when optimizing the surrogate loss
-    :param gamma: Discount factor
-    :param gae_lambda: Factor for trade-off of bias vs variance for Generalized Advantage Estimator
-    :param clip_range: Clipping parameter, it can be a function of the current progress
-        remaining (from 1 to 0).
-    :param clip_range_vf: Clipping parameter for the value function,
-        it can be a function of the current progress remaining (from 1 to 0).
-        This is a parameter specific to the OpenAI implementation. If None is passed (default),
-        no clipping will be done on the value function.
-        IMPORTANT: this clipping depends on the reward scaling.
-    :param normalize_advantage: Whether to normalize or not the advantage
-    :param ent_coef: Entropy coefficient for the loss calculation
-    :param vf_coef: Value function coefficient for the loss calculation
-    :param max_grad_norm: The maximum value for the gradient clipping
-    :param use_sde: Whether to use generalized State Dependent Exploration (gSDE)
-        instead of action noise exploration (default: False)
-    :param sde_sample_freq: Sample a new noise matrix every n steps when using gSDE
-        Default: -1 (only sample at the beginning of the rollout)
-    :param rollout_buffer_class: Rollout buffer class to use. If ``None``, it will be automatically selected.
-    :param rollout_buffer_kwargs: Keyword arguments to pass to the rollout buffer on creation
-    :param target_kl: Limit the KL divergence between updates,
-        because the clipping is not enough to prevent large update
-        see issue #213 (cf https://github.com/hill-a/stable-baselines/issues/213)
-        By default, there is no limit on the kl div.
-    :param stats_window_size: Window size for the rollout logging, specifying the number of episodes to average
-        the reported success rate, mean episode length, and mean reward over
-    :param tensorboard_log: the log location for tensorboard (if None, no logging)
-    :param policy_kwargs: additional arguments to be passed to the policy on creation. See :ref:`ppo_policies`
-    :param verbose: Verbosity level: 0 for no output, 1 for info messages (such as device or wrappers used), 2 for
-        debug messages
-    :param seed: Seed for the pseudo random generators
-    :param device: Device (cpu, cuda, ...) on which the code should be run.
-        Setting it to auto, the code will be run on the GPU if possible.
-    :param separate_optimizers: If True, use two optimizers to update actor and critic separately
-        (hyperparameters identical). Shared feature extractor (if any) is updated once using
-        the combined gradients from both losses.
-    :param _init_setup_model: Whether or not to build the network at the creation of the instance
+    MPO-style algorithm (maximum a posteriori policy optimisation).
+
+    This implementation uses:
+      - a replay buffer populated from on-policy rollouts,
+      - a learned Q critic + target critic,
+      - a target policy snapshot for sampling and KL constraints,
+      - dual variables (temperature, alpha_mean, alpha_stddev) to enforce constraints.
+
+    It is MPO-like in its policy update, while reusing SB3's rollout collection plumbing.
     """
 
     policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
@@ -501,6 +480,9 @@ class MPO(OnPolicyAlgorithm):
     def _actor_mean_std(self, obs_tensor: th.Tensor, *, use_target: bool) -> tuple[th.Tensor, th.Tensor]:
         pol = self.target_policy if use_target else self.policy
         assert pol is not None
+        # Replay/env may provide float64; ensure it matches policy param dtype
+        pol_dtype = next(pol.parameters()).dtype
+        obs_tensor = obs_tensor.to(dtype=pol_dtype)
         d = pol.get_distribution(obs_tensor)
         indep = _as_independent_normal(d)
         mean = indep.base_dist.loc
@@ -510,7 +492,11 @@ class MPO(OnPolicyAlgorithm):
     def train(self) -> None:
         """
         MPO-style update using replay + target networks.
-        Rollout collection is still handled by OnPolicyAlgorithm; we just consume the rollout here.
+
+        High-level loop per gradient step:
+          1) Critic: TD regression to a target computed from target critic and actions sampled from target policy.
+          2) Actor/Duals: MPO loss (E-step weights from Q; M-step KL-constrained policy update via duals).
+          3) Periodically hard-update target policy and target critic.
         """
         assert self.replay_buffer is not None
         assert self.critic is not None and self.critic_target is not None
@@ -539,11 +525,14 @@ class MPO(OnPolicyAlgorithm):
         for _ in range(self.gradient_steps):
             batch = self.replay_buffer.sample(self.batch_size)
 
-            obs = batch.observations
-            next_obs = batch.next_observations
-            actions = batch.actions
-            rewards = batch.rewards.squeeze(-1)
-            dones = batch.dones.squeeze(-1)
+            # Replay/env may provide float64; ensure it matches critic param dtype
+            critic_dtype = next(self.critic.parameters()).dtype
+
+            obs = batch.observations.to(dtype=critic_dtype)
+            next_obs = batch.next_observations.to(dtype=critic_dtype)
+            actions = batch.actions.to(dtype=critic_dtype)
+            rewards = batch.rewards.to(dtype=critic_dtype).squeeze(-1)
+            dones = batch.dones.to(dtype=critic_dtype).squeeze(-1)
 
             # Flatten obs for simple MLP critic (Box obs only)
             obs_f = obs.view(obs.shape[0], -1)

@@ -6,6 +6,9 @@ import torch as th
 from gymnasium import spaces
 from torch.nn import functional as F
 
+import copy
+import torch.distributions as torch_dist
+
 from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.policies import ActorCriticCnnPolicy, ActorCriticPolicy, BasePolicy, MultiInputActorCriticPolicy
@@ -13,6 +16,38 @@ from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedul
 from stable_baselines3.common.utils import FloatSchedule, explained_variance
 
 SelfVMPO = TypeVar("SelfVMPO", bound="VMPO")
+
+
+def _sb3_base_distribution(d: Any) -> Any:
+    # SB3 Distribution wrappers usually expose `.distribution` (torch Distribution or list thereof)
+    return getattr(d, "distribution", d)
+
+
+def _reduce_kl_to_batch(kl: th.Tensor) -> th.Tensor:
+    # Want shape [B]; sum any extra event dims conservatively
+    while kl.dim() > 1:
+        kl = kl.sum(dim=-1)
+    return kl
+
+
+def _analytic_kl_sb3(target_dist: Any, online_dist: Any) -> th.Tensor:
+    """
+    Compute per-state KL: D_KL(target || online) with best-effort support for SB3 dist wrappers.
+    Returns: kl_per_state with shape [B]
+    """
+    p = _sb3_base_distribution(target_dist)
+    q = _sb3_base_distribution(online_dist)
+
+    if isinstance(p, (list, tuple)):
+        if not isinstance(q, (list, tuple)) or len(p) != len(q):
+            raise TypeError(f"Incompatible distributions for KL: {type(p)} vs {type(q)}")
+        kls = []
+        for pi, qi in zip(p, q):
+            kls.append(_reduce_kl_to_batch(torch_dist.kl_divergence(pi, qi)))
+        return th.stack(kls, dim=0).sum(dim=0)
+
+    kl = torch_dist.kl_divergence(p, q)
+    return _reduce_kl_to_batch(kl)
 
 
 class VMPO(OnPolicyAlgorithm):
@@ -102,6 +137,12 @@ class VMPO(OnPolicyAlgorithm):
         normalize_advantage_mean: bool = True,
         normalize_advantage_std: bool = True,
         separate_optimizers: bool = True,
+        # --- V-MPO specific ---
+        epsilon_eta: float = 0.1,
+        epsilon_alpha: float = 0.1,
+        init_eta: float = 1.0,
+        init_alpha: float = 1.0,
+        top_adv_fraction: float = 0.5,
         _init_setup_model: bool = True,
     ):
         super().__init__(
@@ -169,11 +210,26 @@ class VMPO(OnPolicyAlgorithm):
         self.target_kl = target_kl
         self.separate_optimizers = separate_optimizers
 
+        # --- V-MPO hyperparameters ---
+        assert epsilon_eta > 0, "`epsilon_eta` must be > 0"
+        assert epsilon_alpha > 0, "`epsilon_alpha` must be > 0"
+        assert init_eta > 0, "`init_eta` must be > 0"
+        assert init_alpha > 0, "`init_alpha` must be > 0"
+        assert 0 < top_adv_fraction <= 1.0, "`top_adv_fraction` must be in (0, 1]"
+        self.epsilon_eta = float(epsilon_eta)
+        self.epsilon_alpha = float(epsilon_alpha)
+        self.init_eta = float(init_eta)
+        self.init_alpha = float(init_alpha)
+        self.top_adv_fraction = float(top_adv_fraction)
+
         # Split-optimizer related attributes
         self.actor_optimizer: Optional[th.optim.Optimizer] = None
         self.critic_optimizer: Optional[th.optim.Optimizer] = None
         self._actor_params: Optional[list[th.nn.Parameter]] = None
         self._critic_params: Optional[list[th.nn.Parameter]] = None
+
+        # Frozen snapshot used for the analytic distribution-KL constraint within each update
+        self.target_policy: Optional[BasePolicy] = None
 
         if _init_setup_model:
             self._setup_model()
@@ -181,13 +237,22 @@ class VMPO(OnPolicyAlgorithm):
     def _setup_model(self) -> None:
         super()._setup_model()
 
-        # Initialize schedules for policy/value clipping
+        # Initialize schedules for policy/value clipping (kept for backward compat; V-MPO does not use clip_range)
         self.clip_range = FloatSchedule(self.clip_range)
         if self.clip_range_vf is not None:
             if isinstance(self.clip_range_vf, (float, int)):
                 assert self.clip_range_vf > 0, "`clip_range_vf` must be positive, " "pass `None` to deactivate vf clipping"
-
             self.clip_range_vf = FloatSchedule(self.clip_range_vf)
+
+        # Register dual variables on the policy module (so they are checkpointed in policy.state_dict()).
+        def _inv_softplus(x: float, device: th.device) -> th.Tensor:
+            x_t = th.tensor(float(x), device=device)
+            return th.log(th.expm1(x_t))
+
+        if not hasattr(self.policy, "vmpo_log_eta"):
+            self.policy.vmpo_log_eta = th.nn.Parameter(_inv_softplus(self.init_eta, self.device))  # type: ignore[attr-defined]
+        if not hasattr(self.policy, "vmpo_log_alpha"):
+            self.policy.vmpo_log_alpha = th.nn.Parameter(_inv_softplus(self.init_alpha, self.device))  # type: ignore[attr-defined]
 
         # When requested, build two optimizers with separated parameter groups
         if self.separate_optimizers:
@@ -212,151 +277,174 @@ class VMPO(OnPolicyAlgorithm):
             _extend_unique(critic_params, self.policy.mlp_extractor.value_net.parameters())
             _extend_unique(critic_params, self.policy.value_net.parameters())
 
-            # Feature extractors: shared or separate
+            # Feature extractor: update it ONCE with combined gradients (actor+critic).
             if getattr(self.policy, "share_features_extractor", True):
-                _extend_unique(actor_params, self.policy.features_extractor.parameters())
+                _extend_unique(critic_params, self.policy.features_extractor.parameters())
             else:
                 _extend_unique(actor_params, self.policy.pi_features_extractor.parameters())
                 _extend_unique(critic_params, self.policy.vf_features_extractor.parameters())
 
-            # Save param lists for clipping/logging
+            # Dual variables (temperature η and KL multiplier α) are part of the actor-side optimization.
+            actor_params.append(self.policy.vmpo_log_eta)    # type: ignore[attr-defined]
+            actor_params.append(self.policy.vmpo_log_alpha)  # type: ignore[attr-defined]
+
             self._actor_params = actor_params
             self._critic_params = critic_params
 
-            # Create optimizers mirroring policy optimizer hyperparameters
             initial_lr = self.lr_schedule(1)
             self.actor_optimizer = self.policy.optimizer_class(self._actor_params, lr=initial_lr, **self.policy.optimizer_kwargs)  # type: ignore[arg-type]
             self.critic_optimizer = self.policy.optimizer_class(self._critic_params, lr=initial_lr, **self.policy.optimizer_kwargs)  # type: ignore[arg-type]
+        else:
+            # Ensure dual params are optimized even with the single policy optimizer.
+            # (policy optimizer is created in the parent setup)
+            self.policy.optimizer.add_param_group({"params": [self.policy.vmpo_log_eta, self.policy.vmpo_log_alpha]})  # type: ignore[attr-defined]
+
+        # Create target policy once; synced at the start of each train() call (per update)
+        if self.target_policy is None:
+            self.target_policy = copy.deepcopy(self.policy).to(self.device)
+        self.target_policy.set_training_mode(False)
 
     def train(self) -> None:
         """
-        Update policy using the currently gathered rollout buffer.
+        Update policy using the currently gathered rollout buffer. (V-MPO update)
         """
         # Switch to train mode (this affects batch norm / dropout)
         self.policy.set_training_mode(True)
-        # Update optimizer learning rate
-        if self.separate_optimizers:
-            assert self.actor_optimizer is not None and self.critic_optimizer is not None
-            self._update_learning_rate([self.actor_optimizer, self.critic_optimizer])
-        else:
-            self._update_learning_rate(self.policy.optimizer)
-        # Compute current clip range
-        clip_range = self.clip_range(self._current_progress_remaining)  # type: ignore[operator]
-        # Optional: clip range for the value function
-        if self.clip_range_vf is not None:
-            clip_range_vf = self.clip_range_vf(self._current_progress_remaining)  # type: ignore[operator]
+
+        # Sync (freeze) target policy for this whole update: π_tgt := π_old
+        assert self.target_policy is not None
+        self.target_policy.load_state_dict(self.policy.state_dict())
+        self.target_policy.set_training_mode(False)
 
         entropy_losses = []
         pg_losses, value_losses = [], []
-        clip_fractions = []
-        batch_advantages = []
-        batch_norm_advantages = []
-        ratios = []
+        approx_kl_divs = []
+        eta_losses, alpha_losses = [], []
+        kls = []
+        weight_entropies = []
         grad_norms = []
         actor_grad_norms: list[np.ndarray] = []
         critic_grad_norms: list[np.ndarray] = []
+        batch_advantages = []
+        batch_norm_advantages = []
         continue_training = True
-        approx_kl_divs = []
+
         # train for n_epochs epochs
         for epoch in range(self.n_epochs):
             # Do a complete pass on the rollout buffer
             for rollout_data in self.rollout_buffer.get(self.batch_size):
                 actions = rollout_data.actions
                 if isinstance(self.action_space, spaces.Discrete):
-                    # Convert discrete action from float to long
                     actions = rollout_data.actions.long().flatten()
 
                 values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
                 values = values.flatten()
-                # Normalize advantage
+
                 advantages = rollout_data.advantages
-                batch_advantages.append(advantages.cpu().numpy())
+                batch_advantages.append(advantages.detach().cpu().numpy())
 
-                # Normalization does not make sense if mini batchsize == 1, see GH issue #325
-                if self.normalize_advantage and len(advantages) > 1:  # Apply mean and/or std normalization based on switches
-                    # If both switches are False, keep advantages as-is
-                    if self.normalize_advantage_mean or self.normalize_advantage_std:
-                        if self.normalize_advantage_mean:
-                            advantages = advantages - advantages.mean()
-                        if self.normalize_advantage_std:
-                            advantages = advantages / (advantages.std() + 1e-8)
-                        batch_norm_advantages.append(advantages.cpu().numpy())
+                # V-MPO E-step uses exp(A/eta): mean-centering is OK, std-normalization changes eta's meaning.
+                advantages_estep = advantages
+                if self.normalize_advantage and len(advantages_estep) > 1:
+                    if self.normalize_advantage_mean:
+                        advantages_estep = advantages_estep - advantages_estep.mean()
+                        batch_norm_advantages.append(advantages_estep.detach().cpu().numpy())
+                    # IMPORTANT: do not std-normalize for V-MPO E-step (skip even if normalize_advantage_std=True)
 
-                advantages = advantages * self.advantage_multiplier
-                # ratio between old and new policy, should be one at the first iteration
-                ratio = th.exp(log_prob - rollout_data.old_log_prob)
-                ratios.append(ratio.detach().cpu().numpy())
-                # clipped surrogate loss
-                policy_loss_1 = advantages * ratio
-                policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
-                policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
+                advantages_estep = advantages_estep * self.advantage_multiplier
 
-                # For score-only loss used by ScoreAdam, we need to know which samples are
-                # clipped according to the *original* PPO objective (that depends on advantage
-                # sign and magnitude). We record this mask once using the true losses.
+                # --- V-MPO KL: analytic state-averaged distribution KL ---
                 with th.no_grad():
-                    # True PPO uses the min between the unclipped and clipped objectives
-                    # (for each sample). Wherever policy_loss_2 < policy_loss_1, the clipped
-                    # objective is active.
-                    use_clipped_mask = policy_loss_2 < policy_loss_1
+                    tgt_dist = self.target_policy.get_distribution(rollout_data.observations)
+                online_dist = self.policy.get_distribution(rollout_data.observations)
+                kl_vec = _analytic_kl_sb3(tgt_dist, online_dist)  # [B]
+                kl = kl_vec.mean()
+                kls.append(kl.detach().cpu().item())
+                approx_kl_divs.append(kl.detach().cpu().item())
 
-                # Logging
+                # Early stopping (optional)
+                if self.target_kl is not None and kl.detach().cpu().item() > 1.5 * self.target_kl:
+                    continue_training = False
+                    if self.verbose >= 1:
+                        print(f"Early stopping at epoch {epoch} due to reaching max KL: {kl.detach().cpu().item():.4f}")
+                    break
+
+                # --- V-MPO E-step: select top-advantage samples and compute weights ---
+                batch_n = advantages_estep.shape[0]
+                k = max(1, int(self.top_adv_fraction * batch_n))
+                topk = th.topk(advantages_estep, k=k, sorted=False)
+                sel_adv = topk.values
+                sel_log_prob = log_prob[topk.indices]
+
+                eta = F.softplus(self.policy.vmpo_log_eta) + 1e-8  # type: ignore[attr-defined]
+                logits = (sel_adv / eta.detach()).clamp(-50, 50)
+                weights = th.softmax(logits, dim=0).detach()
+                policy_loss = -(weights * sel_log_prob).sum()
                 pg_losses.append(policy_loss.item())
-                clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
-                clip_fractions.append(clip_fraction)
 
-                if self.clip_range_vf is None:
-                    # No clipping
-                    values_pred = values
-                else:
-                    # Clip the difference between old and new value
-                    # NOTE: this depends on the reward scaling
-                    values_pred = rollout_data.old_values + th.clamp(
-                        values - rollout_data.old_values, -clip_range_vf, clip_range_vf
-                    )
-                # Value loss using the TD(gae_lambda) target
-                value_loss = F.mse_loss(rollout_data.returns, values_pred)
-                value_losses.append(value_loss.item())
+                # --- V-MPO dual loss for eta (temperature) ---
+                with th.no_grad():
+                    denom = th.log(th.tensor(float(k), device=sel_adv.device, dtype=sel_adv.dtype))
+                lse = th.logsumexp(sel_adv.detach() / eta, dim=0) - denom
+                eta_loss = eta * (self.epsilon_eta + lse)
+                eta_losses.append(eta_loss.item())
 
-                # Entropy loss favor exploration
+                # --- V-MPO KL constraint via alpha (Lagrange multiplier) ---
+                alpha = F.softplus(self.policy.vmpo_log_alpha) + 1e-8  # type: ignore[attr-defined]
+                alpha_loss = alpha * (self.epsilon_alpha - kl.detach())
+                alpha_losses.append(alpha_loss.item())
+                kl_penalty = alpha.detach() * kl
+
+                # Entropy loss (optional)
                 if entropy is None:
-                    # Approximate entropy when no analytical form
                     entropy_loss = -th.mean(-log_prob)
                 else:
                     entropy_loss = -th.mean(entropy)
-
                 entropy_losses.append(entropy_loss.item())
 
-                combined_loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+                # Track weight entropy (diagnostic)
+                with th.no_grad():
+                    w_ent = -(weights * th.log(weights.clamp_min(1e-12))).sum()
+                    weight_entropies.append(w_ent.cpu().item())
 
-                # Calculate approximate form of reverse KL Divergence for early stopping
-                # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
-                # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419
-                # and Schulman blog: http://joschu.net/blog/kl-approx.html
+                # Critic loss
+                if self.clip_range_vf is None:
+                    values_pred = values
+                else:
+                    clip_range_vf = self.clip_range_vf(self._current_progress_remaining)  # type: ignore[operator]
+                    values_pred = rollout_data.old_values + th.clamp(
+                        values - rollout_data.old_values, -clip_range_vf, clip_range_vf
+                    )
 
-                if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
-                    continue_training = False
+                value_loss = F.mse_loss(rollout_data.returns, values_pred)
+                value_losses.append(value_loss.item())
 
-                if epoch == self.n_epochs - 1 or not continue_training:
-                    with th.no_grad():
-                        log_ratio = log_prob - rollout_data.old_log_prob
-                        approx_kl_div = th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
-                        approx_kl_divs.append(approx_kl_div)
+                actor_total_loss = policy_loss + self.ent_coef * entropy_loss + kl_penalty + eta_loss + alpha_loss
+                critic_total_loss = self.vf_coef * value_loss
+                total_loss = actor_total_loss + critic_total_loss
 
-                if not continue_training:
-                    if self.verbose >= 1:
-                        print(f"Early stopping at step {epoch} due to reaching max kl: {approx_kl_div:.2f}")
-                    break
+                # Optimize
+                if self.separate_optimizers:
+                    assert self.actor_optimizer is not None and self.critic_optimizer is not None
+                    assert self._actor_params is not None and self._critic_params is not None
 
-                # Optional: compute score-only gradients (∇ log π and ratio/clip structure,
-                # but without advantage scaling) for ScoreAdam. We re-use the clipping
-                # decision from the true PPO objective via `use_clipped_mask`.
+                    self.actor_optimizer.zero_grad()
+                    self.critic_optimizer.zero_grad()
+                    total_loss.backward()
 
-                self.policy.optimizer.zero_grad()
-                combined_loss.backward()
-                # Clip grad norm
-                grad_norms.append(th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm).cpu().numpy())
-                self.policy.optimizer.step()
+                    actor_gn = th.nn.utils.clip_grad_norm_(self._actor_params, self.max_grad_norm).detach().cpu().numpy()
+                    critic_gn = th.nn.utils.clip_grad_norm_(self._critic_params, self.max_grad_norm).detach().cpu().numpy()
+                    actor_grad_norms.append(actor_gn)
+                    critic_grad_norms.append(critic_gn)
+
+                    # Step both; shared feature extractor (if any) is only in critic optimizer.
+                    self.critic_optimizer.step()
+                    self.actor_optimizer.step()
+                else:
+                    self.policy.optimizer.zero_grad()
+                    total_loss.backward()
+                    grad_norms.append(th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm).detach().cpu().numpy())
+                    self.policy.optimizer.step()
 
             self._n_updates += 1
             if not continue_training:
@@ -365,38 +453,47 @@ class VMPO(OnPolicyAlgorithm):
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
         # Logs
-        self.logger.record("train/ratios_mean", np.mean(ratios))
         if len(batch_advantages) > 0:
             self.logger.record("train/advantages_mean", np.mean(batch_advantages))
             self.logger.record("train/advantages_sum", np.sum(batch_advantages))
         if len(batch_norm_advantages) > 0:
             self.logger.record("train/advantages_norm_mean", np.mean(batch_norm_advantages))
             self.logger.record("train/advantages_norm_sum", np.sum(batch_norm_advantages))
-        self.logger.record("train/entropy_loss", np.mean(entropy_losses))
-        self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
+
+        self.logger.record("train/policy_loss_vmpo", np.mean(pg_losses))
         self.logger.record("train/value_loss", np.mean(value_losses))
+        self.logger.record("train/entropy_loss", np.mean(entropy_losses))
+        self.logger.record("train/kl_pi_old_pi_new", np.mean(kls))
         self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
-        self.logger.record("train/clip_fraction", np.mean(clip_fractions))
-        # Record last combined loss value
-        self.logger.record("train/loss", combined_loss.item())
+        self.logger.record("train/eta_loss", np.mean(eta_losses))
+        self.logger.record("train/alpha_loss", np.mean(alpha_losses))
+        if len(weight_entropies) > 0:
+            self.logger.record("train/weights_entropy", np.mean(weight_entropies))
+
+        # Dual variable values
+        if hasattr(self.policy, "vmpo_log_eta"):
+            eta_val = (F.softplus(self.policy.vmpo_log_eta) + 1e-8).detach().cpu().item()  # type: ignore[attr-defined]
+            self.logger.record("train/eta", eta_val)
+        if hasattr(self.policy, "vmpo_log_alpha"):
+            alpha_val = (F.softplus(self.policy.vmpo_log_alpha) + 1e-8).detach().cpu().item()  # type: ignore[attr-defined]
+            self.logger.record("train/alpha", alpha_val)
+
         self.logger.record("train/explained_variance", explained_var)
-        # Grad norm logging
+
         if len(actor_grad_norms) > 0:
-            self.logger.record("train/grad_norm_actor", np.mean(actor_grad_norms))
-            self.logger.record("train/grad_norm_actor/max", np.max(actor_grad_norms))
+            self.logger.record("train/grad_norm_actor", float(np.mean(actor_grad_norms)))
+            self.logger.record("train/grad_norm_actor/max", float(np.max(actor_grad_norms)))
         if len(critic_grad_norms) > 0:
-            self.logger.record("train/grad_norm_critic", np.mean(critic_grad_norms))
-            self.logger.record("train/grad_norm_critic/max", np.max(critic_grad_norms))
+            self.logger.record("train/grad_norm_critic", float(np.mean(critic_grad_norms)))
+            self.logger.record("train/grad_norm_critic/max", float(np.max(critic_grad_norms)))
         if len(grad_norms) > 0:
-            self.logger.record("train/grad_norm", np.mean(grad_norms))
-            self.logger.record("train/grad_norm/max", np.max(grad_norms))
+            self.logger.record("train/grad_norm", float(np.mean(grad_norms)))
+            self.logger.record("train/grad_norm/max", float(np.max(grad_norms)))
+
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
 
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
-        self.logger.record("train/clip_range", clip_range)
-        if self.clip_range_vf is not None:
-            self.logger.record("train/clip_range_vf", clip_range_vf)
 
     def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
         """
