@@ -285,7 +285,7 @@ class VMPO(OnPolicyAlgorithm):
                 _extend_unique(critic_params, self.policy.vf_features_extractor.parameters())
 
             # Dual variables (temperature η and KL multiplier α) are part of the actor-side optimization.
-            actor_params.append(self.policy.vmpo_log_eta)    # type: ignore[attr-defined]
+            actor_params.append(self.policy.vmpo_log_eta)  # type: ignore[attr-defined]
             actor_params.append(self.policy.vmpo_log_alpha)  # type: ignore[attr-defined]
 
             self._actor_params = actor_params
@@ -428,6 +428,9 @@ class VMPO(OnPolicyAlgorithm):
                     assert self.actor_optimizer is not None and self.critic_optimizer is not None
                     assert self._actor_params is not None and self._critic_params is not None
 
+                    self._update_learning_rate(self.actor_optimizer)
+                    self._update_learning_rate(self.critic_optimizer)
+
                     self.actor_optimizer.zero_grad()
                     self.critic_optimizer.zero_grad()
                     total_loss.backward()
@@ -441,9 +444,12 @@ class VMPO(OnPolicyAlgorithm):
                     self.critic_optimizer.step()
                     self.actor_optimizer.step()
                 else:
+                    self._update_learning_rate(self.policy.optimizer)
                     self.policy.optimizer.zero_grad()
                     total_loss.backward()
-                    grad_norms.append(th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm).detach().cpu().numpy())
+                    grad_norms.append(
+                        th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm).detach().cpu().numpy()
+                    )
                     self.policy.optimizer.step()
 
             self._n_updates += 1
