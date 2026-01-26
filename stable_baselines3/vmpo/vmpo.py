@@ -143,6 +143,11 @@ class VMPO(OnPolicyAlgorithm):
         init_eta: float = 1.0,
         init_alpha: float = 1.0,
         top_adv_fraction: float = 0.5,
+        # --- DAE (Direct Advantage Estimation) ---
+        use_dae: bool = False,
+        dae_coef: float = 1.0,
+        dae_center_mc_samples: int = 8,
+        dae_detach_policy_adv: bool = True,
         _init_setup_model: bool = True,
     ):
         super().__init__(
@@ -231,8 +236,26 @@ class VMPO(OnPolicyAlgorithm):
         # Frozen snapshot used for the analytic distribution-KL constraint within each update
         self.target_policy: Optional[BasePolicy] = None
 
+        # --- DAE flags/hparams ---
+        self.use_dae = bool(use_dae)
+        self.dae_coef = float(dae_coef)
+        self.dae_center_mc_samples = int(dae_center_mc_samples)
+        self.dae_detach_policy_adv = bool(dae_detach_policy_adv)
+        assert self.dae_center_mc_samples >= 1, "`dae_center_mc_samples` must be >= 1"
+        assert self.dae_coef >= 0.0, "`dae_coef` must be >= 0"
+        self._last_dones: Optional[np.ndarray] = None  # <-- add (robustness)
+
         if _init_setup_model:
             self._setup_model()
+
+    def collect_rollouts(self, env, callback, rollout_buffer, n_rollout_steps: int) -> bool:
+        """
+        Store last-step dones for DAE bootstrapping mask.
+        """
+        ok = super().collect_rollouts(env, callback, rollout_buffer, n_rollout_steps)
+        # SB3 convention: _last_episode_starts equals `dones` from the last env step.
+        self._last_dones = np.array(self._last_episode_starts, copy=True)
+        return ok
 
     def _setup_model(self) -> None:
         super()._setup_model()
@@ -253,6 +276,10 @@ class VMPO(OnPolicyAlgorithm):
             self.policy.vmpo_log_eta = th.nn.Parameter(_inv_softplus(self.init_eta, self.device))  # type: ignore[attr-defined]
         if not hasattr(self.policy, "vmpo_log_alpha"):
             self.policy.vmpo_log_alpha = th.nn.Parameter(_inv_softplus(self.init_alpha, self.device))  # type: ignore[attr-defined]
+
+        # --- DAE: attach advantage head early so it's included in deepcopy(target_policy) and optimizers ---
+        if self.use_dae:
+            self._ensure_dae_adv_net()
 
         # When requested, build two optimizers with separated parameter groups
         if self.separate_optimizers:
@@ -288,6 +315,10 @@ class VMPO(OnPolicyAlgorithm):
             actor_params.append(self.policy.vmpo_log_eta)  # type: ignore[attr-defined]
             actor_params.append(self.policy.vmpo_log_alpha)  # type: ignore[attr-defined]
 
+            # DAE advantage head: trained with DAE regression (place on critic-side by default)
+            if self.use_dae and hasattr(self.policy, "dae_adv_net"):
+                _extend_unique(critic_params, self.policy.dae_adv_net.parameters())  # type: ignore[attr-defined]
+
             self._actor_params = actor_params
             self._critic_params = critic_params
 
@@ -296,13 +327,168 @@ class VMPO(OnPolicyAlgorithm):
             self.critic_optimizer = self.policy.optimizer_class(self._critic_params, lr=initial_lr, **self.policy.optimizer_kwargs)  # type: ignore[arg-type]
         else:
             # Ensure dual params are optimized even with the single policy optimizer.
-            # (policy optimizer is created in the parent setup)
             self.policy.optimizer.add_param_group({"params": [self.policy.vmpo_log_eta, self.policy.vmpo_log_alpha]})  # type: ignore[attr-defined]
+            if self.use_dae and hasattr(self.policy, "dae_adv_net"):
+                self.policy.optimizer.add_param_group({"params": list(self.policy.dae_adv_net.parameters())})  # type: ignore[attr-defined]
 
         # Create target policy once; synced at the start of each train() call (per update)
         if self.target_policy is None:
             self.target_policy = copy.deepcopy(self.policy).to(self.device)
         self.target_policy.set_training_mode(False)
+
+    def _ensure_dae_adv_net(self) -> None:
+        """
+        Attach a learned advantage head onto `self.policy`:
+        - Discrete: A(s,·) in R^{|A|} from latent_pi
+        - Box:      A(s,a) scalar via MLP([latent_pi, action])
+        """
+        if hasattr(self.policy, "dae_adv_net"):
+            return
+
+        if not isinstance(self.action_space, (spaces.Discrete, spaces.Box)):
+            raise NotImplementedError("DAE is implemented for Discrete and Box action spaces only.")
+
+        # Actor latent size (preferred); fallback for older SB3 variants
+        latent_dim = int(getattr(self.policy.mlp_extractor, "latent_dim_pi", None) or self.policy.mlp_extractor.latent_pi_dim)  # type: ignore[attr-defined]
+
+        if isinstance(self.action_space, spaces.Discrete):
+            act_dim = int(self.action_space.n)
+            self.policy.dae_adv_net = th.nn.Linear(latent_dim, act_dim).to(self.device)  # type: ignore[attr-defined]
+        else:
+            act_dim = int(np.prod(self.action_space.shape))
+            self.policy._dae_act_dim = act_dim  # type: ignore[attr-defined]
+            self.policy.dae_adv_net = th.nn.Sequential(  # type: ignore[attr-defined]
+                th.nn.Linear(latent_dim + act_dim, 256),
+                th.nn.Tanh(),
+                th.nn.Linear(256, 1),
+            ).to(self.device)
+
+    def _dae_latent_pi(self, obs: Any) -> th.Tensor:
+        """
+        Actor latent used for A-hat. If policy uses separate feature extractors, use pi_features_extractor.
+        """
+        if getattr(self.policy, "share_features_extractor", True):
+            features = self.policy.extract_features(obs)
+        else:
+            features = self.policy.extract_features(obs, features_extractor=self.policy.pi_features_extractor)
+        latent_pi, _latent_vf = self.policy.mlp_extractor(features)
+        return latent_pi
+
+    def _dae_adv_centered(self, obs: Any, actions: th.Tensor) -> th.Tensor:
+        """
+        Centered learned advantage: A_hat(s,a) - E_{a~mu}[A_hat(s,a)], with mu = target_policy snapshot.
+        Returned shape: [B]
+        """
+        self._ensure_dae_adv_net()
+        assert self.target_policy is not None
+
+        latent_pi = self._dae_latent_pi(obs)  # NOTE: no detach here; DAE may train representation
+
+        if isinstance(self.action_space, spaces.Discrete):
+            logits_A = self.policy.dae_adv_net(latent_pi)  # type: ignore[attr-defined]  # [B, act_dim]
+            a = actions.long().view(-1, 1)
+            A_sa = logits_A.gather(1, a).squeeze(1)
+
+            with th.no_grad():
+                mu = _sb3_base_distribution(self.target_policy.get_distribution(obs))
+                mu_probs = mu.probs  # [B, act_dim]
+            baseline = (mu_probs * logits_A).sum(dim=1)
+            return A_sa - baseline
+
+        act_dim = int(getattr(self.policy, "_dae_act_dim"))  # type: ignore[attr-defined]
+        a = actions.view(-1, act_dim).float()
+        A_sa = self.policy.dae_adv_net(th.cat([latent_pi, a], dim=1)).squeeze(1)  # type: ignore[attr-defined]
+
+        with th.no_grad():
+            mu = _sb3_base_distribution(self.target_policy.get_distribution(obs))
+            K = int(self.dae_center_mc_samples)
+            a_samp = mu.sample((K,))  # [K, B, act_dim] (best-effort)
+            a_samp = a_samp.view(K * a.shape[0], act_dim).float()
+
+        latent_rep = latent_pi.unsqueeze(0).expand(K, *latent_pi.shape).reshape(K * latent_pi.shape[0], -1)
+        A_samp = self.policy.dae_adv_net(th.cat([latent_rep, a_samp], dim=1)).view(K, latent_pi.shape[0])  # type: ignore[attr-defined]
+        baseline = A_samp.mean(dim=0)
+        return A_sa - baseline
+
+    def _dae_loss_on_rollout(self) -> th.Tensor:
+        """
+        DAE regression loss (Pan et al., Eq. 13) via backward recursion over the full rollout.
+        Handles RolloutBuffer layouts that store obs/actions either as [T, N, ...] or [T*N, ...].
+        """
+        assert self._last_dones is not None, "DAE needs last-step dones; ensure collect_rollouts() was called."
+        assert self.target_policy is not None
+
+        self._ensure_dae_adv_net()
+
+        # Determine (T, N) from episode_starts (most consistent across SB3 versions)
+        episode_starts_np = self.rollout_buffer.episode_starts  # numpy
+        if episode_starts_np.ndim != 2:
+            raise ValueError(f"Expected rollout_buffer.episode_starts to be 2D [T,N], got shape={episode_starts_np.shape}")
+        T, N = episode_starts_np.shape
+
+        def _as_tn(x_np: np.ndarray, name: str) -> np.ndarray:
+            """
+            Ensure x is shaped [T, N, ...] (or [T, N] for scalars).
+            Accepts already-shaped [T,N,...] or flattened [T*N,...].
+            """
+            if x_np.shape[0] == T and (x_np.ndim == 1 or x_np.shape[1] == N):
+                # [T,N,...] or [T] (shouldn't happen for rollout tensors, but keep safe)
+                return x_np if x_np.ndim != 1 else x_np.reshape(T, 1)
+            if x_np.shape[0] == T * N:
+                return x_np.reshape(T, N, *x_np.shape[1:])
+            raise ValueError(
+                f"Cannot coerce {name} to [T,N,...]. "
+                f"T={T}, N={N}, got shape={x_np.shape} (expected first dim {T} or {T*N})."
+            )
+
+        # Rewards/episode_starts are expected [T,N] in SB3
+        rewards = th.as_tensor(_as_tn(self.rollout_buffer.rewards, "rewards"), device=self.device).float()  # [T,N]
+        episode_starts = th.as_tensor(episode_starts_np, device=self.device).float()  # [T,N]
+
+        # Observations may be stored as [T,N,...] or flattened [T*N,...]
+        obs_np = self.rollout_buffer.observations
+        if isinstance(obs_np, dict):
+            obs_tn = {k: _as_tn(v, f"observations[{k}]") for k, v in obs_np.items()}
+            obs_flat = {k: th.as_tensor(v.reshape(T * N, *v.shape[2:]), device=self.device) for k, v in obs_tn.items()}
+        else:
+            obs_tn = _as_tn(obs_np, "observations")
+            obs_flat = th.as_tensor(obs_tn.reshape(T * N, *obs_tn.shape[2:]), device=self.device)
+
+        # Actions may be stored as [T,N,act_dim] or flattened [T*N,act_dim] (or [T,N] / [T*N] for discrete)
+        actions_np = self.rollout_buffer.actions
+        actions_tn = _as_tn(actions_np, "actions")
+
+        if isinstance(self.action_space, spaces.Discrete):
+            # SB3 often stores discrete actions with trailing dim=1; normalize to [T*N]
+            act_flat = th.as_tensor(actions_tn.reshape(T * N, -1), device=self.device).long().squeeze(-1)
+        else:
+            act_flat = th.as_tensor(actions_tn.reshape(T * N, -1), device=self.device).float()
+
+        # mask[t,n] = 1 if not terminal after step t
+        mask = th.ones((T, N), device=self.device)
+        if T > 1:
+            mask[:-1] = 1.0 - episode_starts[1:]
+        last_dones = th.as_tensor(self._last_dones, device=self.device).float()  # [N]
+        mask[-1] = 1.0 - last_dones
+
+        A = self._dae_adv_centered(obs_flat, act_flat).view(T, N)  # centered A-hat
+        V = self.policy.predict_values(obs_flat).view(T, N)
+
+        # Bootstrap V_target(s_T)
+        last_obs_t, _ = self.policy.obs_to_tensor(self._last_obs)  # type: ignore[arg-type]
+        with th.no_grad():
+            V_T = self.target_policy.predict_values(last_obs_t).view(N) * (1.0 - last_dones)
+
+        # Backward recursion
+        y_next = V_T
+        sqerrs = []
+        for t in range(T - 1, -1, -1):
+            y_t = (rewards[t] - A[t]) + self.gamma * mask[t] * y_next
+            e_t = y_t - V[t]
+            sqerrs.append((e_t ** 2).mean())
+            y_next = y_t
+
+        return th.stack(list(reversed(sqerrs))).mean()
 
     def train(self) -> None:
         """
@@ -328,6 +514,7 @@ class VMPO(OnPolicyAlgorithm):
         batch_advantages = []
         batch_norm_advantages = []
         continue_training = True
+        dae_losses = []
 
         # train for n_epochs epochs
         for epoch in range(self.n_epochs):
@@ -343,13 +530,16 @@ class VMPO(OnPolicyAlgorithm):
                 advantages = rollout_data.advantages
                 batch_advantages.append(advantages.detach().cpu().numpy())
 
-                # V-MPO E-step uses exp(A/eta): mean-centering is OK, std-normalization changes eta's meaning.
-                advantages_estep = advantages
-                if self.normalize_advantage and len(advantages_estep) > 1:
-                    if self.normalize_advantage_mean:
-                        advantages_estep = advantages_estep - advantages_estep.mean()
-                        batch_norm_advantages.append(advantages_estep.detach().cpu().numpy())
-                    # IMPORTANT: do not std-normalize for V-MPO E-step (skip even if normalize_advantage_std=True)
+                # --- Advantages used for VMPO E-step ---
+                if self.use_dae:
+                    adv_hat = self._dae_adv_centered(rollout_data.observations, actions)
+                    advantages_estep = adv_hat.detach() if self.dae_detach_policy_adv else adv_hat
+                else:
+                    advantages_estep = advantages
+                    if self.normalize_advantage and len(advantages_estep) > 1:
+                        if self.normalize_advantage_mean:
+                            advantages_estep = advantages_estep - advantages_estep.mean()
+                            batch_norm_advantages.append(advantages_estep.detach().cpu().numpy())
 
                 advantages_estep = advantages_estep * self.advantage_multiplier
 
@@ -452,6 +642,35 @@ class VMPO(OnPolicyAlgorithm):
                     )
                     self.policy.optimizer.step()
 
+            # --- DAE regression step (full-rollout, keeps temporal structure) ---
+            if self.use_dae and self.dae_coef > 0.0:
+                dae_loss = self._dae_loss_on_rollout()
+                dae_losses.append(float(dae_loss.detach().cpu().item()))
+
+                if self.separate_optimizers:
+                    assert self.actor_optimizer is not None and self.critic_optimizer is not None
+                    assert self._actor_params is not None and self._critic_params is not None
+
+                    # DAE should be allowed to train representation (latent_pi path) + value path + dae_adv_net
+                    self._update_learning_rate(self.actor_optimizer)
+                    self._update_learning_rate(self.critic_optimizer)
+
+                    self.actor_optimizer.zero_grad()
+                    self.critic_optimizer.zero_grad()
+                    (self.dae_coef * dae_loss).backward()
+
+                    th.nn.utils.clip_grad_norm_(self._actor_params, self.max_grad_norm)
+                    th.nn.utils.clip_grad_norm_(self._critic_params, self.max_grad_norm)
+
+                    self.critic_optimizer.step()
+                    self.actor_optimizer.step()
+                else:
+                    self._update_learning_rate(self.policy.optimizer)
+                    self.policy.optimizer.zero_grad()
+                    (self.dae_coef * dae_loss).backward()
+                    th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                    self.policy.optimizer.step()
+
             self._n_updates += 1
             if not continue_training:
                 break
@@ -475,6 +694,8 @@ class VMPO(OnPolicyAlgorithm):
         self.logger.record("train/alpha_loss", np.mean(alpha_losses))
         if len(weight_entropies) > 0:
             self.logger.record("train/weights_entropy", np.mean(weight_entropies))
+        if len(dae_losses) > 0:
+            self.logger.record("train/dae_loss", float(np.mean(dae_losses)))
 
         # Dual variable values
         if hasattr(self.policy, "vmpo_log_eta"):
