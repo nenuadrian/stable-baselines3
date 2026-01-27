@@ -428,7 +428,10 @@ class VMPO(OnPolicyAlgorithm):
             if self.normalize_advantage_std:
                 adv_std_t = advantages_estep_all.std(unbiased=False) + 1e-8
                 advantages_estep_all = advantages_estep_all / adv_std_t
-            batch_norm_advantages.append(advantages_estep_all.detach().cpu().numpy())
+        # Defensive: remove NaN/inf and clamp extremes to prevent overflow in exp
+        advantages_estep_all = th.nan_to_num(advantages_estep_all, nan=0.0, posinf=0.0, neginf=0.0)
+        advantages_estep_all = advantages_estep_all.clamp(min=-100.0, max=100.0)
+        batch_norm_advantages.append(advantages_estep_all.detach().cpu().numpy())
 
         total_samples = int(advantages_estep_all.shape[0])
         k = max(1, int(self.top_adv_fraction * total_samples))
@@ -460,6 +463,7 @@ class VMPO(OnPolicyAlgorithm):
 
         # Freeze eta for the whole policy update (all epochs in this iteration)
         eta_fixed = (F.softplus(self.policy.vmpo_log_eta) + 1e-8).detach()  # type: ignore[attr-defined]
+        eta_fixed = eta_fixed.clamp_min(1e-4)
         logsumexp_all_fixed = th.logsumexp(selected_adv_detached / eta_fixed, dim=0)
 
         # train for n_epochs epochs
@@ -477,15 +481,20 @@ class VMPO(OnPolicyAlgorithm):
                 batch_advantages.append(advantages.detach().cpu().numpy())
 
                 advantages_estep_mb = advantages
+                # --- Normalize advantages ---
                 if self.normalize_advantage and advantages_estep_mb.numel() > 1:
                     if self.normalize_advantage_mean and adv_mean_t is not None:
                         advantages_estep_mb = advantages_estep_mb - adv_mean_t
                     if self.normalize_advantage_std and adv_std_t is not None:
                         advantages_estep_mb = advantages_estep_mb / adv_std_t
                 advantages_estep_mb = advantages_estep_mb * self.advantage_multiplier
+                advantages_estep_mb = th.nan_to_num(advantages_estep_mb, nan=0.0, posinf=0.0, neginf=0.0)
+                advantages_estep_mb = advantages_estep_mb.clamp(min=-100.0, max=100.0)
 
                 mask_mb = advantages_estep_mb >= adv_threshold
-                weights_mb = th.exp(advantages_estep_mb / eta_fixed - logsumexp_all_fixed) * mask_mb
+                log_w = advantages_estep_mb / eta_fixed - logsumexp_all_fixed
+                log_w = log_w.clamp(min=-50.0, max=50.0)
+                weights_mb = th.exp(log_w) * mask_mb
 
                 policy_loss = -(weights_mb * log_prob).sum()
                 pg_losses.append(policy_loss.item())
@@ -698,7 +707,14 @@ class VMPO(OnPolicyAlgorithm):
         Include separate optimizers in state dicts when enabled.
         """
         if self.separate_optimizers:
-            return ["policy", "policy.optimizer", "actor_optimizer", "critic_optimizer", "alpha_optimizer", "eta_optimizer"], []
+            return [
+                "policy",
+                "policy.optimizer",
+                "actor_optimizer",
+                "critic_optimizer",
+                "alpha_optimizer",
+                "eta_optimizer",
+            ], []
         # Default behavior from parent
         return super()._get_torch_save_params()
 
