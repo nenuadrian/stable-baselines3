@@ -11,7 +11,7 @@ Integration note:
   - Rollouts are collected via SB3's OnPolicyAlgorithm, then converted into an off-policy replay
     buffer that MPO-style updates sample from.
 Limitations:
-  - Currently supports Box observation/action spaces only, with an MLP critic over flattened obs.
+  - Continuous Box observation/action spaces only. Discrete environments are not supported.
 """
 
 from typing import Any, ClassVar, Optional, TypeVar, Union
@@ -251,7 +251,7 @@ class MPO(OnPolicyAlgorithm):
       - a target policy snapshot for sampling and KL constraints,
       - dual variables (temperature, alpha_mean, alpha_stddev) to enforce constraints.
 
-    It is MPO-like in its policy update, while reusing SB3's rollout collection plumbing.
+    Note: This implementation supports only Box (continuous) action/observation spaces.
     """
 
     policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
@@ -324,7 +324,6 @@ class MPO(OnPolicyAlgorithm):
             supported_action_spaces=(spaces.Box,),
         )
 
-        # ...existing fields...
         self.batch_size = int(batch_size)
         self.n_epochs = int(n_epochs)
         self.clip_range = clip_range

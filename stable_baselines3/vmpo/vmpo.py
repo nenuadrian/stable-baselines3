@@ -1,13 +1,13 @@
 import warnings
 from typing import Any, ClassVar, Optional, TypeVar, Union
 
-import numpy as np
-import torch as th
-from gymnasium import spaces
-from torch.nn import functional as F
+import numpy as np  # type: ignore[import]
+import torch as th  # type: ignore[import]
+from gymnasium import spaces  # type: ignore[import]
+from torch.nn import functional as F  # type: ignore[import]
 
 import copy
-import torch.distributions as torch_dist
+import torch.distributions as torch_dist  # type: ignore[import]
 
 from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
@@ -32,8 +32,10 @@ def _reduce_kl_to_batch(kl: th.Tensor) -> th.Tensor:
 
 def _analytic_kl_sb3(target_dist: Any, online_dist: Any) -> th.Tensor:
     """
-    Compute per-state KL: D_KL(target || online) with best-effort support for SB3 dist wrappers.
+    Compute per-state KL: D_KL(p || q) with best-effort support for SB3 dist wrappers.
     Returns: kl_per_state with shape [B]
+
+    Note: caller decides which direction by passing (p, q) in that order.
     """
     p = _sb3_base_distribution(target_dist)
     q = _sb3_base_distribution(online_dist)
@@ -48,6 +50,42 @@ def _analytic_kl_sb3(target_dist: Any, online_dist: Any) -> th.Tensor:
 
     kl = torch_dist.kl_divergence(p, q)
     return _reduce_kl_to_batch(kl)
+
+
+def _split_diag_gaussian_kl(target_dist: Any, online_dist: Any) -> Optional[tuple[th.Tensor, th.Tensor]]:
+    """
+    Best-effort split KL for diagonal Gaussians into mean and std components.
+
+    Computes KL(p || q) where p=target_dist and q=online_dist (in that order).
+    Returns per-state tensors (kl_mean, kl_std) with shape [B], or None if unsupported.
+    """
+    p = _sb3_base_distribution(target_dist)
+    q = _sb3_base_distribution(online_dist)
+
+    if isinstance(p, torch_dist.Independent):
+        p = p.base_dist
+    if isinstance(q, torch_dist.Independent):
+        q = q.base_dist
+
+    if not isinstance(p, torch_dist.Normal) or not isinstance(q, torch_dist.Normal):
+        return None
+
+    # For KL(p||q): mean term uses q-variance; std term uses log(sigma_q/sigma_p) and var_p/var_q
+    mu_p, mu_q = p.loc, q.loc
+    sigma_p, sigma_q = p.scale, q.scale
+    sigma_p = sigma_p.clamp_min(1e-6)
+    sigma_q = sigma_q.clamp_min(1e-6)
+    var_p, var_q = sigma_p**2, sigma_q**2
+
+    mean_term = (mu_p - mu_q) ** 2 / (2.0 * var_q)
+    std_term = (th.log(sigma_q) - th.log(sigma_p)) + (var_p / (2.0 * var_q)) - 0.5
+
+    while mean_term.dim() > 1:
+        mean_term = mean_term.sum(dim=-1)
+    while std_term.dim() > 1:
+        std_term = std_term.sum(dim=-1)
+
+    return mean_term, std_term
 
 
 class VMPO(OnPolicyAlgorithm):
@@ -140,14 +178,14 @@ class VMPO(OnPolicyAlgorithm):
         # --- V-MPO specific ---
         epsilon_eta: float = 0.1,
         epsilon_alpha: float = 0.1,
+        epsilon_alpha_mean: float = 0.02,
+        epsilon_alpha_std: float = 0.02,
         init_eta: float = 1.0,
         init_alpha: float = 1.0,
+        init_alpha_mean: float = 1.0,
+        init_alpha_std: float = 1.0,
         top_adv_fraction: float = 0.5,
-        # --- DAE (Direct Advantage Estimation) ---
-        use_dae: bool = False,
-        dae_coef: float = 1.0,
-        dae_center_mc_samples: int = 8,
-        dae_detach_policy_adv: bool = True,
+        eta_n_steps: int = 1,  # NEW: explicit eta dual steps per iteration
         _init_setup_model: bool = True,
     ):
         super().__init__(
@@ -221,41 +259,34 @@ class VMPO(OnPolicyAlgorithm):
         assert init_eta > 0, "`init_eta` must be > 0"
         assert init_alpha > 0, "`init_alpha` must be > 0"
         assert 0 < top_adv_fraction <= 1.0, "`top_adv_fraction` must be in (0, 1]"
+        assert eta_n_steps >= 1, "`eta_n_steps` must be >= 1"
+        self.top_adv_fraction = float(top_adv_fraction)
+        self.eta_n_steps = int(eta_n_steps)
+
         self.epsilon_eta = float(epsilon_eta)
         self.epsilon_alpha = float(epsilon_alpha)
+        self.epsilon_alpha_mean = float(epsilon_alpha_mean)
+        self.epsilon_alpha_std = float(epsilon_alpha_std)
         self.init_eta = float(init_eta)
         self.init_alpha = float(init_alpha)
-        self.top_adv_fraction = float(top_adv_fraction)
+        self.init_alpha_mean = float(init_alpha_mean)
+        self.init_alpha_std = float(init_alpha_std)
 
         # Split-optimizer related attributes
         self.actor_optimizer: Optional[th.optim.Optimizer] = None
         self.critic_optimizer: Optional[th.optim.Optimizer] = None
+        self.alpha_optimizer: Optional[th.optim.Optimizer] = None
+        self.eta_optimizer: Optional[th.optim.Optimizer] = None  # NEW: dual optimizer for eta
         self._actor_params: Optional[list[th.nn.Parameter]] = None
         self._critic_params: Optional[list[th.nn.Parameter]] = None
 
         # Frozen snapshot used for the analytic distribution-KL constraint within each update
         self.target_policy: Optional[BasePolicy] = None
 
-        # --- DAE flags/hparams ---
-        self.use_dae = bool(use_dae)
-        self.dae_coef = float(dae_coef)
-        self.dae_center_mc_samples = int(dae_center_mc_samples)
-        self.dae_detach_policy_adv = bool(dae_detach_policy_adv)
-        assert self.dae_center_mc_samples >= 1, "`dae_center_mc_samples` must be >= 1"
-        assert self.dae_coef >= 0.0, "`dae_coef` must be >= 0"
-        self._last_dones: Optional[np.ndarray] = None  # <-- add (robustness)
+        self._last_dones: Optional[np.ndarray] = None
 
         if _init_setup_model:
             self._setup_model()
-
-    def collect_rollouts(self, env, callback, rollout_buffer, n_rollout_steps: int) -> bool:
-        """
-        Store last-step dones for DAE bootstrapping mask.
-        """
-        ok = super().collect_rollouts(env, callback, rollout_buffer, n_rollout_steps)
-        # SB3 convention: _last_episode_starts equals `dones` from the last env step.
-        self._last_dones = np.array(self._last_episode_starts, copy=True)
-        return ok
 
     def _setup_model(self) -> None:
         super()._setup_model()
@@ -276,10 +307,10 @@ class VMPO(OnPolicyAlgorithm):
             self.policy.vmpo_log_eta = th.nn.Parameter(_inv_softplus(self.init_eta, self.device))  # type: ignore[attr-defined]
         if not hasattr(self.policy, "vmpo_log_alpha"):
             self.policy.vmpo_log_alpha = th.nn.Parameter(_inv_softplus(self.init_alpha, self.device))  # type: ignore[attr-defined]
-
-        # --- DAE: attach advantage head early so it's included in deepcopy(target_policy) and optimizers ---
-        if self.use_dae:
-            self._ensure_dae_adv_net()
+        if not hasattr(self.policy, "vmpo_log_alpha_mean"):
+            self.policy.vmpo_log_alpha_mean = th.nn.Parameter(_inv_softplus(self.init_alpha_mean, self.device))  # type: ignore[attr-defined]
+        if not hasattr(self.policy, "vmpo_log_alpha_std"):
+            self.policy.vmpo_log_alpha_std = th.nn.Parameter(_inv_softplus(self.init_alpha_std, self.device))  # type: ignore[attr-defined]
 
         # When requested, build two optimizers with separated parameter groups
         if self.separate_optimizers:
@@ -311,184 +342,48 @@ class VMPO(OnPolicyAlgorithm):
                 _extend_unique(actor_params, self.policy.pi_features_extractor.parameters())
                 _extend_unique(critic_params, self.policy.vf_features_extractor.parameters())
 
-            # Dual variables (temperature η and KL multiplier α) are part of the actor-side optimization.
-            actor_params.append(self.policy.vmpo_log_eta)  # type: ignore[attr-defined]
-            actor_params.append(self.policy.vmpo_log_alpha)  # type: ignore[attr-defined]
-
-            # DAE advantage head: trained with DAE regression (place on critic-side by default)
-            if self.use_dae and hasattr(self.policy, "dae_adv_net"):
-                _extend_unique(critic_params, self.policy.dae_adv_net.parameters())  # type: ignore[attr-defined]
-
+            # Dual variables: do NOT optimize η with the actor loss; update it via its own dual objective.
+            # (Keep α updated separately too.)
             self._actor_params = actor_params
             self._critic_params = critic_params
 
             initial_lr = self.lr_schedule(1)
+            alpha_lr = initial_lr * 0.1
+            eta_lr = initial_lr * 0.1
+
             self.actor_optimizer = self.policy.optimizer_class(self._actor_params, lr=initial_lr, **self.policy.optimizer_kwargs)  # type: ignore[arg-type]
             self.critic_optimizer = self.policy.optimizer_class(self._critic_params, lr=initial_lr, **self.policy.optimizer_kwargs)  # type: ignore[arg-type]
+            self.alpha_optimizer = self.policy.optimizer_class(
+                [self.policy.vmpo_log_alpha, self.policy.vmpo_log_alpha_mean, self.policy.vmpo_log_alpha_std],
+                lr=alpha_lr,
+                **self.policy.optimizer_kwargs,
+            )  # type: ignore[arg-type,attr-defined]
+            self.eta_optimizer = self.policy.optimizer_class(
+                [self.policy.vmpo_log_eta],
+                lr=eta_lr,
+                **self.policy.optimizer_kwargs,
+            )  # type: ignore[arg-type,attr-defined]
         else:
-            # Ensure dual params are optimized even with the single policy optimizer.
-            self.policy.optimizer.add_param_group({"params": [self.policy.vmpo_log_eta, self.policy.vmpo_log_alpha]})  # type: ignore[attr-defined]
-            if self.use_dae and hasattr(self.policy, "dae_adv_net"):
-                self.policy.optimizer.add_param_group({"params": list(self.policy.dae_adv_net.parameters())})  # type: ignore[attr-defined]
+            # Ensure dual params are NOT optimized via the single policy optimizer.
+            initial_lr = self.lr_schedule(1)
+            alpha_lr = initial_lr * 0.1
+            eta_lr = initial_lr * 0.1
+            self.alpha_optimizer = self.policy.optimizer_class(
+                [self.policy.vmpo_log_alpha, self.policy.vmpo_log_alpha_mean, self.policy.vmpo_log_alpha_std],
+                lr=alpha_lr,
+                **self.policy.optimizer_kwargs,
+            )  # type: ignore[arg-type,attr-defined]
+            self.eta_optimizer = self.policy.optimizer_class(
+                [self.policy.vmpo_log_eta],
+                lr=eta_lr,
+                **self.policy.optimizer_kwargs,
+            )  # type: ignore[arg-type,attr-defined]
 
         # Create target policy once; synced at the start of each train() call (per update)
         if self.target_policy is None:
             self.target_policy = copy.deepcopy(self.policy).to(self.device)
-        self.target_policy.set_training_mode(False)
-
-    def _ensure_dae_adv_net(self) -> None:
-        """
-        Attach a learned advantage head onto `self.policy`:
-        - Discrete: A(s,·) in R^{|A|} from latent_pi
-        - Box:      A(s,a) scalar via MLP([latent_pi, action])
-        """
-        if hasattr(self.policy, "dae_adv_net"):
-            return
-
-        if not isinstance(self.action_space, (spaces.Discrete, spaces.Box)):
-            raise NotImplementedError("DAE is implemented for Discrete and Box action spaces only.")
-
-        # Actor latent size (preferred); fallback for older SB3 variants
-        latent_dim = int(getattr(self.policy.mlp_extractor, "latent_dim_pi", None) or self.policy.mlp_extractor.latent_pi_dim)  # type: ignore[attr-defined]
-
-        if isinstance(self.action_space, spaces.Discrete):
-            act_dim = int(self.action_space.n)
-            self.policy.dae_adv_net = th.nn.Linear(latent_dim, act_dim).to(self.device)  # type: ignore[attr-defined]
-        else:
-            act_dim = int(np.prod(self.action_space.shape))
-            self.policy._dae_act_dim = act_dim  # type: ignore[attr-defined]
-            self.policy.dae_adv_net = th.nn.Sequential(  # type: ignore[attr-defined]
-                th.nn.Linear(latent_dim + act_dim, 256),
-                th.nn.Tanh(),
-                th.nn.Linear(256, 1),
-            ).to(self.device)
-
-    def _dae_latent_pi(self, obs: Any) -> th.Tensor:
-        """
-        Actor latent used for A-hat. If policy uses separate feature extractors, use pi_features_extractor.
-        """
-        if getattr(self.policy, "share_features_extractor", True):
-            features = self.policy.extract_features(obs)
-        else:
-            features = self.policy.extract_features(obs, features_extractor=self.policy.pi_features_extractor)
-        latent_pi, _latent_vf = self.policy.mlp_extractor(features)
-        return latent_pi
-
-    def _dae_adv_centered(self, obs: Any, actions: th.Tensor) -> th.Tensor:
-        """
-        Centered learned advantage: A_hat(s,a) - E_{a~mu}[A_hat(s,a)], with mu = target_policy snapshot.
-        Returned shape: [B]
-        """
-        self._ensure_dae_adv_net()
-        assert self.target_policy is not None
-
-        latent_pi = self._dae_latent_pi(obs)  # NOTE: no detach here; DAE may train representation
-
-        if isinstance(self.action_space, spaces.Discrete):
-            logits_A = self.policy.dae_adv_net(latent_pi)  # type: ignore[attr-defined]  # [B, act_dim]
-            a = actions.long().view(-1, 1)
-            A_sa = logits_A.gather(1, a).squeeze(1)
-
-            with th.no_grad():
-                mu = _sb3_base_distribution(self.target_policy.get_distribution(obs))
-                mu_probs = mu.probs  # [B, act_dim]
-            baseline = (mu_probs * logits_A).sum(dim=1)
-            return A_sa - baseline
-
-        act_dim = int(getattr(self.policy, "_dae_act_dim"))  # type: ignore[attr-defined]
-        a = actions.view(-1, act_dim).float()
-        A_sa = self.policy.dae_adv_net(th.cat([latent_pi, a], dim=1)).squeeze(1)  # type: ignore[attr-defined]
-
-        with th.no_grad():
-            mu = _sb3_base_distribution(self.target_policy.get_distribution(obs))
-            K = int(self.dae_center_mc_samples)
-            a_samp = mu.sample((K,))  # [K, B, act_dim] (best-effort)
-            a_samp = a_samp.view(K * a.shape[0], act_dim).float()
-
-        latent_rep = latent_pi.unsqueeze(0).expand(K, *latent_pi.shape).reshape(K * latent_pi.shape[0], -1)
-        A_samp = self.policy.dae_adv_net(th.cat([latent_rep, a_samp], dim=1)).view(K, latent_pi.shape[0])  # type: ignore[attr-defined]
-        baseline = A_samp.mean(dim=0)
-        return A_sa - baseline
-
-    def _dae_loss_on_rollout(self) -> th.Tensor:
-        """
-        DAE regression loss (Pan et al., Eq. 13) via backward recursion over the full rollout.
-        Handles RolloutBuffer layouts that store obs/actions either as [T, N, ...] or [T*N, ...].
-        """
-        assert self._last_dones is not None, "DAE needs last-step dones; ensure collect_rollouts() was called."
-        assert self.target_policy is not None
-
-        self._ensure_dae_adv_net()
-
-        # Determine (T, N) from episode_starts (most consistent across SB3 versions)
-        episode_starts_np = self.rollout_buffer.episode_starts  # numpy
-        if episode_starts_np.ndim != 2:
-            raise ValueError(f"Expected rollout_buffer.episode_starts to be 2D [T,N], got shape={episode_starts_np.shape}")
-        T, N = episode_starts_np.shape
-
-        def _as_tn(x_np: np.ndarray, name: str) -> np.ndarray:
-            """
-            Ensure x is shaped [T, N, ...] (or [T, N] for scalars).
-            Accepts already-shaped [T,N,...] or flattened [T*N,...].
-            """
-            if x_np.shape[0] == T and (x_np.ndim == 1 or x_np.shape[1] == N):
-                # [T,N,...] or [T] (shouldn't happen for rollout tensors, but keep safe)
-                return x_np if x_np.ndim != 1 else x_np.reshape(T, 1)
-            if x_np.shape[0] == T * N:
-                return x_np.reshape(T, N, *x_np.shape[1:])
-            raise ValueError(
-                f"Cannot coerce {name} to [T,N,...]. "
-                f"T={T}, N={N}, got shape={x_np.shape} (expected first dim {T} or {T*N})."
-            )
-
-        # Rewards/episode_starts are expected [T,N] in SB3
-        rewards = th.as_tensor(_as_tn(self.rollout_buffer.rewards, "rewards"), device=self.device).float()  # [T,N]
-        episode_starts = th.as_tensor(episode_starts_np, device=self.device).float()  # [T,N]
-
-        # Observations may be stored as [T,N,...] or flattened [T*N,...]
-        obs_np = self.rollout_buffer.observations
-        if isinstance(obs_np, dict):
-            obs_tn = {k: _as_tn(v, f"observations[{k}]") for k, v in obs_np.items()}
-            obs_flat = {k: th.as_tensor(v.reshape(T * N, *v.shape[2:]), device=self.device) for k, v in obs_tn.items()}
-        else:
-            obs_tn = _as_tn(obs_np, "observations")
-            obs_flat = th.as_tensor(obs_tn.reshape(T * N, *obs_tn.shape[2:]), device=self.device)
-
-        # Actions may be stored as [T,N,act_dim] or flattened [T*N,act_dim] (or [T,N] / [T*N] for discrete)
-        actions_np = self.rollout_buffer.actions
-        actions_tn = _as_tn(actions_np, "actions")
-
-        if isinstance(self.action_space, spaces.Discrete):
-            # SB3 often stores discrete actions with trailing dim=1; normalize to [T*N]
-            act_flat = th.as_tensor(actions_tn.reshape(T * N, -1), device=self.device).long().squeeze(-1)
-        else:
-            act_flat = th.as_tensor(actions_tn.reshape(T * N, -1), device=self.device).float()
-
-        # mask[t,n] = 1 if not terminal after step t
-        mask = th.ones((T, N), device=self.device)
-        if T > 1:
-            mask[:-1] = 1.0 - episode_starts[1:]
-        last_dones = th.as_tensor(self._last_dones, device=self.device).float()  # [N]
-        mask[-1] = 1.0 - last_dones
-
-        A = self._dae_adv_centered(obs_flat, act_flat).view(T, N)  # centered A-hat
-        V = self.policy.predict_values(obs_flat).view(T, N)
-
-        # Bootstrap V_target(s_T)
-        last_obs_t, _ = self.policy.obs_to_tensor(self._last_obs)  # type: ignore[arg-type]
-        with th.no_grad():
-            V_T = self.target_policy.predict_values(last_obs_t).view(N) * (1.0 - last_dones)
-
-        # Backward recursion
-        y_next = V_T
-        sqerrs = []
-        for t in range(T - 1, -1, -1):
-            y_t = (rewards[t] - A[t]) + self.gamma * mask[t] * y_next
-            e_t = y_t - V[t]
-            sqerrs.append((e_t ** 2).mean())
-            y_next = y_t
-
-        return th.stack(list(reversed(sqerrs))).mean()
+        if self.target_policy is not None:
+            self.target_policy.set_training_mode(False)
 
     def train(self) -> None:
         """
@@ -506,19 +401,69 @@ class VMPO(OnPolicyAlgorithm):
         pg_losses, value_losses = [], []
         approx_kl_divs = []
         eta_losses, alpha_losses = [], []
+        alpha_dual_mean, alpha_dual_std = [], []
         kls = []
+        kl_means, kl_stds = [], []
+        kl_split_available = []
         weight_entropies = []
+        weight_ess = []
         grad_norms = []
         actor_grad_norms: list[np.ndarray] = []
         critic_grad_norms: list[np.ndarray] = []
         batch_advantages = []
         batch_norm_advantages = []
         continue_training = True
-        dae_losses = []
+
+        # --- Precompute advantages/top-k/weights once per update ---
+        advantages_all = th.as_tensor(self.rollout_buffer.advantages, device=self.device).flatten()
+        advantages_estep_all = advantages_all
+
+        # --- Normalize advantages ---
+        adv_mean_t: Optional[th.Tensor] = None
+        adv_std_t: Optional[th.Tensor] = None
+        if self.normalize_advantage and advantages_estep_all.numel() > 1:
+            if self.normalize_advantage_mean:
+                adv_mean_t = advantages_estep_all.mean()
+                advantages_estep_all = advantages_estep_all - adv_mean_t
+            if self.normalize_advantage_std:
+                adv_std_t = advantages_estep_all.std(unbiased=False) + 1e-8
+                advantages_estep_all = advantages_estep_all / adv_std_t
+            batch_norm_advantages.append(advantages_estep_all.detach().cpu().numpy())
+
+        total_samples = int(advantages_estep_all.shape[0])
+        k = max(1, int(self.top_adv_fraction * total_samples))
+
+        sel_adv, _ = th.topk(advantages_estep_all, k)
+        adv_threshold = sel_adv.min()
+        mask_all = advantages_estep_all >= adv_threshold
+        selected_adv = advantages_estep_all[mask_all]
+        k_eff = selected_adv.numel()
+        selected_adv_detached = selected_adv.detach()
+
+        with th.no_grad():
+            denom = th.log(th.tensor(float(k_eff), device=selected_adv.device, dtype=selected_adv.dtype))
+
+        # --- Dual ascent for eta (global objective) ONCE per iteration, with explicit inner steps ---
+        if self.eta_optimizer is not None:
+            for _ in range(self.eta_n_steps):
+                eta = F.softplus(self.policy.vmpo_log_eta) + 1e-8  # type: ignore[attr-defined]
+                # L_eta(eta) = eta * (epsilon_eta + log( (1/K) * sum_{i in S} exp(A_i / eta) ))
+                # Use log-sum-exp: logmeanexp = logsumexp - logK
+                logmeanexp = th.logsumexp(selected_adv_detached / eta, dim=0) - denom
+                eta_loss_global = eta * (self.epsilon_eta + logmeanexp)
+
+                self._update_learning_rate(self.eta_optimizer)
+                self.eta_optimizer.zero_grad()
+                eta_loss_global.backward()
+                self.eta_optimizer.step()
+                eta_losses.append(float(eta_loss_global.detach().cpu().item()))
+
+        # Freeze eta for the whole policy update (all epochs in this iteration)
+        eta_fixed = (F.softplus(self.policy.vmpo_log_eta) + 1e-8).detach()  # type: ignore[attr-defined]
+        logsumexp_all_fixed = th.logsumexp(selected_adv_detached / eta_fixed, dim=0)
 
         # train for n_epochs epochs
         for epoch in range(self.n_epochs):
-            # Do a complete pass on the rollout buffer
             for rollout_data in self.rollout_buffer.get(self.batch_size):
                 actions = rollout_data.actions
                 if isinstance(self.action_space, spaces.Discrete):
@@ -526,64 +471,69 @@ class VMPO(OnPolicyAlgorithm):
 
                 values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
                 values = values.flatten()
+                log_prob = log_prob.flatten()
 
                 advantages = rollout_data.advantages
                 batch_advantages.append(advantages.detach().cpu().numpy())
 
-                # --- Advantages used for VMPO E-step ---
-                if self.use_dae:
-                    adv_hat = self._dae_adv_centered(rollout_data.observations, actions)
-                    advantages_estep = adv_hat.detach() if self.dae_detach_policy_adv else adv_hat
-                else:
-                    advantages_estep = advantages
-                    if self.normalize_advantage and len(advantages_estep) > 1:
-                        if self.normalize_advantage_mean:
-                            advantages_estep = advantages_estep - advantages_estep.mean()
-                            batch_norm_advantages.append(advantages_estep.detach().cpu().numpy())
+                advantages_estep_mb = advantages
+                if self.normalize_advantage and advantages_estep_mb.numel() > 1:
+                    if self.normalize_advantage_mean and adv_mean_t is not None:
+                        advantages_estep_mb = advantages_estep_mb - adv_mean_t
+                    if self.normalize_advantage_std and adv_std_t is not None:
+                        advantages_estep_mb = advantages_estep_mb / adv_std_t
+                advantages_estep_mb = advantages_estep_mb * self.advantage_multiplier
 
-                advantages_estep = advantages_estep * self.advantage_multiplier
+                mask_mb = advantages_estep_mb >= adv_threshold
+                weights_mb = th.exp(advantages_estep_mb / eta_fixed - logsumexp_all_fixed) * mask_mb
 
-                # --- V-MPO KL: analytic state-averaged distribution KL ---
+                policy_loss = -(weights_mb * log_prob).sum()
+                pg_losses.append(policy_loss.item())
+
+                # --- V-MPO KL: state-averaged distribution KL (use reverse KL: KL(new || old)) ---
                 with th.no_grad():
-                    tgt_dist = self.target_policy.get_distribution(rollout_data.observations)
-                online_dist = self.policy.get_distribution(rollout_data.observations)
-                kl_vec = _analytic_kl_sb3(tgt_dist, online_dist)  # [B]
+                    tgt_dist = self.target_policy.get_distribution(rollout_data.observations)  # old
+                online_dist = self.policy.get_distribution(rollout_data.observations)  # new
+
+                # want KL(new || old)
+                kl_vec = _analytic_kl_sb3(online_dist, tgt_dist)  # [B]
                 kl = kl_vec.mean()
                 kls.append(kl.detach().cpu().item())
                 approx_kl_divs.append(kl.detach().cpu().item())
 
-                # Early stopping (optional)
-                if self.target_kl is not None and kl.detach().cpu().item() > 1.5 * self.target_kl:
+                if self.target_kl is not None and kl > 1.5 * self.target_kl:
                     continue_training = False
-                    if self.verbose >= 1:
-                        print(f"Early stopping at epoch {epoch} due to reaching max KL: {kl.detach().cpu().item():.4f}")
                     break
 
-                # --- V-MPO E-step: select top-advantage samples and compute weights ---
-                batch_n = advantages_estep.shape[0]
-                k = max(1, int(self.top_adv_fraction * batch_n))
-                topk = th.topk(advantages_estep, k=k, sorted=False)
-                sel_adv = topk.values
-                sel_log_prob = log_prob[topk.indices]
+                split_kl = _split_diag_gaussian_kl(online_dist, tgt_dist)
+                kl_split_available.append(float(split_kl is not None))
+                if split_kl is not None:
+                    kl_mean_vec, kl_std_vec = split_kl
+                    kl_mean = kl_mean_vec.mean()
+                    kl_std = kl_std_vec.mean()
 
-                eta = F.softplus(self.policy.vmpo_log_eta) + 1e-8  # type: ignore[attr-defined]
-                logits = (sel_adv / eta.detach()).clamp(-50, 50)
-                weights = th.softmax(logits, dim=0).detach()
-                policy_loss = -(weights * sel_log_prob).sum()
-                pg_losses.append(policy_loss.item())
+                    kl_means.append(kl_mean.detach().cpu().item())
+                    kl_stds.append(kl_std.detach().cpu().item())
 
-                # --- V-MPO dual loss for eta (temperature) ---
-                with th.no_grad():
-                    denom = th.log(th.tensor(float(k), device=sel_adv.device, dtype=sel_adv.dtype))
-                lse = th.logsumexp(sel_adv.detach() / eta, dim=0) - denom
-                eta_loss = eta * (self.epsilon_eta + lse)
-                eta_losses.append(eta_loss.item())
+                    alpha_m = F.softplus(self.policy.vmpo_log_alpha_mean) + 1e-8  # type: ignore[attr-defined]
+                    alpha_s = F.softplus(self.policy.vmpo_log_alpha_std) + 1e-8  # type: ignore[attr-defined]
 
+                    alpha_m_dual = alpha_m * (kl_mean.detach() - self.epsilon_alpha_mean)
+                    alpha_s_dual = alpha_s * (kl_std.detach() - self.epsilon_alpha_std)
+                    alpha_dual_mean.append(alpha_m_dual.item())
+                    alpha_dual_std.append(alpha_s_dual.item())
+                    alpha_losses.append((alpha_m_dual + alpha_s_dual).item())
+                    kl_penalty = alpha_m.detach() * kl_mean + alpha_s.detach() * kl_std
+                else:
+                    alpha = F.softplus(self.policy.vmpo_log_alpha) + 1e-8  # type: ignore[attr-defined]
+                    alpha_dual = alpha * (kl.detach() - self.epsilon_alpha)
+                    alpha_losses.append(alpha_dual.item())
+                    kl_penalty = alpha.detach() * kl
                 # --- V-MPO KL constraint via alpha (Lagrange multiplier) ---
-                alpha = F.softplus(self.policy.vmpo_log_alpha) + 1e-8  # type: ignore[attr-defined]
-                alpha_loss = alpha * (self.epsilon_alpha - kl.detach())
-                alpha_losses.append(alpha_loss.item())
-                kl_penalty = alpha.detach() * kl
+                # alpha = F.softplus(self.policy.vmpo_log_alpha) + 1e-8
+                # alpha_dual = alpha * (kl.detach() - self.epsilon_alpha)
+                # alpha_losses.append(alpha_dual.item())
+                # kl_penalty = alpha.detach() * kl
 
                 # Entropy loss (optional)
                 if entropy is None:
@@ -594,8 +544,12 @@ class VMPO(OnPolicyAlgorithm):
 
                 # Track weight entropy (diagnostic)
                 with th.no_grad():
-                    w_ent = -(weights * th.log(weights.clamp_min(1e-12))).sum()
+                    w = weights_mb
+                    w_sum = w.sum().clamp_min(1e-12)
+                    p = w / w_sum
+                    w_ent = -(p * th.log(p.clamp_min(1e-12))).sum()
                     weight_entropies.append(w_ent.cpu().item())
+                    weight_ess.append(th.exp(w_ent).cpu().item())
 
                 # Critic loss
                 if self.clip_range_vf is None:
@@ -609,7 +563,7 @@ class VMPO(OnPolicyAlgorithm):
                 value_loss = F.mse_loss(rollout_data.returns, values_pred)
                 value_losses.append(value_loss.item())
 
-                actor_total_loss = policy_loss + self.ent_coef * entropy_loss + kl_penalty + eta_loss + alpha_loss
+                actor_total_loss = policy_loss + self.ent_coef * entropy_loss + kl_penalty
                 critic_total_loss = self.vf_coef * value_loss
                 total_loss = actor_total_loss + critic_total_loss
 
@@ -633,6 +587,7 @@ class VMPO(OnPolicyAlgorithm):
                     # Step both; shared feature extractor (if any) is only in critic optimizer.
                     self.critic_optimizer.step()
                     self.actor_optimizer.step()
+                    # self._clamp_log_std()
                 else:
                     self._update_learning_rate(self.policy.optimizer)
                     self.policy.optimizer.zero_grad()
@@ -642,34 +597,22 @@ class VMPO(OnPolicyAlgorithm):
                     )
                     self.policy.optimizer.step()
 
-            # --- DAE regression step (full-rollout, keeps temporal structure) ---
-            if self.use_dae and self.dae_coef > 0.0:
-                dae_loss = self._dae_loss_on_rollout()
-                dae_losses.append(float(dae_loss.detach().cpu().item()))
-
-                if self.separate_optimizers:
-                    assert self.actor_optimizer is not None and self.critic_optimizer is not None
-                    assert self._actor_params is not None and self._critic_params is not None
-
-                    # DAE should be allowed to train representation (latent_pi path) + value path + dae_adv_net
-                    self._update_learning_rate(self.actor_optimizer)
-                    self._update_learning_rate(self.critic_optimizer)
-
-                    self.actor_optimizer.zero_grad()
-                    self.critic_optimizer.zero_grad()
-                    (self.dae_coef * dae_loss).backward()
-
-                    th.nn.utils.clip_grad_norm_(self._actor_params, self.max_grad_norm)
-                    th.nn.utils.clip_grad_norm_(self._critic_params, self.max_grad_norm)
-
-                    self.critic_optimizer.step()
-                    self.actor_optimizer.step()
-                else:
-                    self._update_learning_rate(self.policy.optimizer)
-                    self.policy.optimizer.zero_grad()
-                    (self.dae_coef * dae_loss).backward()
-                    th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-                    self.policy.optimizer.step()
+                # Dual ascent step for alpha (separate from primal updates)
+                if self.alpha_optimizer is not None:
+                    self._update_learning_rate(self.alpha_optimizer)
+                    self.alpha_optimizer.zero_grad()
+                    if split_kl is not None:
+                        alpha_m = F.softplus(self.policy.vmpo_log_alpha_mean) + 1e-8  # type: ignore[attr-defined]
+                        alpha_s = F.softplus(self.policy.vmpo_log_alpha_std) + 1e-8  # type: ignore[attr-defined]
+                        alpha_step_loss = -(
+                            alpha_m * (kl_mean.detach() - self.epsilon_alpha_mean)
+                            + alpha_s * (kl_std.detach() - self.epsilon_alpha_std)
+                        )
+                    else:
+                        alpha = F.softplus(self.policy.vmpo_log_alpha) + 1e-8  # type: ignore[attr-defined]
+                        alpha_step_loss = -(alpha * (kl.detach() - self.epsilon_alpha))
+                    alpha_step_loss.backward()
+                    self.alpha_optimizer.step()
 
             self._n_updates += 1
             if not continue_training:
@@ -679,23 +622,40 @@ class VMPO(OnPolicyAlgorithm):
 
         # Logs
         if len(batch_advantages) > 0:
-            self.logger.record("train/advantages_mean", np.mean(batch_advantages))
-            self.logger.record("train/advantages_sum", np.sum(batch_advantages))
+            adv = np.concatenate([a.reshape(-1) for a in batch_advantages])
+            self.logger.record("train/advantages_mean", float(adv.mean()))
+            self.logger.record("train/advantages_sum", float(adv.sum()))
         if len(batch_norm_advantages) > 0:
-            self.logger.record("train/advantages_norm_mean", np.mean(batch_norm_advantages))
-            self.logger.record("train/advantages_norm_sum", np.sum(batch_norm_advantages))
+            advn = np.concatenate([a.reshape(-1) for a in batch_norm_advantages])
+            self.logger.record("train/advantages_norm_mean", float(advn.mean()))
+            self.logger.record("train/advantages_norm_sum", float(advn.sum()))
 
-        self.logger.record("train/policy_loss_vmpo", np.mean(pg_losses))
-        self.logger.record("train/value_loss", np.mean(value_losses))
-        self.logger.record("train/entropy_loss", np.mean(entropy_losses))
-        self.logger.record("train/kl_pi_old_pi_new", np.mean(kls))
-        self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
-        self.logger.record("train/eta_loss", np.mean(eta_losses))
-        self.logger.record("train/alpha_loss", np.mean(alpha_losses))
-        if len(weight_entropies) > 0:
-            self.logger.record("train/weights_entropy", np.mean(weight_entropies))
-        if len(dae_losses) > 0:
-            self.logger.record("train/dae_loss", float(np.mean(dae_losses)))
+        def _log_mean(name: str, xs) -> None:
+            if len(xs) > 0:
+                self.logger.record(name, float(np.mean(xs)))
+
+        def _log_max(name: str, xs) -> None:
+            if len(xs) > 0:
+                self.logger.record(name, float(np.max(xs)))
+
+        _log_mean("train/policy_loss_vmpo", pg_losses)
+        _log_mean("train/value_loss", value_losses)
+        _log_mean("train/entropy_loss", entropy_losses)
+
+        _log_mean("train/kl_pi_new_pi_old", kls)
+
+        self.logger.record(
+            "train/kl_split_available", float(np.mean(kl_split_available)) if len(kl_split_available) > 0 else 0.0
+        )
+        _log_mean("train/kl_mean", kl_means)
+        _log_mean("train/kl_std", kl_stds)
+        _log_mean("train/approx_kl", approx_kl_divs)
+        _log_mean("train/eta_loss", eta_losses)
+        _log_mean("train/alpha_dual", alpha_losses)
+        _log_mean("train/alpha_dual_mean", alpha_dual_mean)
+        _log_mean("train/alpha_dual_std", alpha_dual_std)
+        _log_mean("train/weights_entropy", weight_entropies)
+        _log_mean("train/weights_eff_sample_size", weight_ess)
 
         # Dual variable values
         if hasattr(self.policy, "vmpo_log_eta"):
@@ -704,30 +664,41 @@ class VMPO(OnPolicyAlgorithm):
         if hasattr(self.policy, "vmpo_log_alpha"):
             alpha_val = (F.softplus(self.policy.vmpo_log_alpha) + 1e-8).detach().cpu().item()  # type: ignore[attr-defined]
             self.logger.record("train/alpha", alpha_val)
+        if hasattr(self.policy, "vmpo_log_alpha_mean"):
+            alpha_mean_val = (F.softplus(self.policy.vmpo_log_alpha_mean) + 1e-8).detach().cpu().item()  # type: ignore[attr-defined]
+            self.logger.record("train/alpha_mean", alpha_mean_val)
+        if hasattr(self.policy, "vmpo_log_alpha_std"):
+            alpha_std_val = (F.softplus(self.policy.vmpo_log_alpha_std) + 1e-8).detach().cpu().item()  # type: ignore[attr-defined]
+            self.logger.record("train/alpha_std", alpha_std_val)
 
         self.logger.record("train/explained_variance", explained_var)
 
         if len(actor_grad_norms) > 0:
-            self.logger.record("train/grad_norm_actor", float(np.mean(actor_grad_norms)))
-            self.logger.record("train/grad_norm_actor/max", float(np.max(actor_grad_norms)))
+            _log_mean("train/grad_norm_actor", actor_grad_norms)
+            _log_max("train/grad_norm_actor/max", actor_grad_norms)
         if len(critic_grad_norms) > 0:
-            self.logger.record("train/grad_norm_critic", float(np.mean(critic_grad_norms)))
-            self.logger.record("train/grad_norm_critic/max", float(np.max(critic_grad_norms)))
+            _log_mean("train/grad_norm_critic", critic_grad_norms)
+            _log_max("train/grad_norm_critic/max", critic_grad_norms)
         if len(grad_norms) > 0:
-            self.logger.record("train/grad_norm", float(np.mean(grad_norms)))
-            self.logger.record("train/grad_norm/max", float(np.max(grad_norms)))
+            _log_mean("train/grad_norm", grad_norms)
+            _log_max("train/grad_norm/max", grad_norms)
 
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
 
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
 
+    def _clamp_log_std(self) -> None:
+        if hasattr(self.policy, "log_std"):
+            with th.no_grad():
+                self.policy.log_std.data.clamp_(min=float(np.log(0.2)), max=float(np.log(2.0)))
+
     def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
         """
         Include separate optimizers in state dicts when enabled.
         """
         if self.separate_optimizers:
-            return ["policy", "policy.optimizer", "actor_optimizer", "critic_optimizer"], []
+            return ["policy", "policy.optimizer", "actor_optimizer", "critic_optimizer", "alpha_optimizer", "eta_optimizer"], []
         # Default behavior from parent
         return super()._get_torch_save_params()
 
