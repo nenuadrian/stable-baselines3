@@ -768,7 +768,7 @@ class DAEMPO(OnPolicyAlgorithm):
                 with th.no_grad():
                     tgt_dist = self.target_policy.get_distribution(obs_mb_flat)  # old (μ)
                 online_dist = self.policy.get_distribution(obs_mb_flat)
-                kl_vec = _analytic_kl_sb3(tgt_dist, online_dist)
+                kl_vec = _analytic_kl_sb3(online_dist, tgt_dist)
                 kl = kl_vec.mean()
                 kls.append(kl.detach().cpu().item())
                 approx_kl_divs.append(kl.detach().cpu().item())
@@ -777,7 +777,7 @@ class DAEMPO(OnPolicyAlgorithm):
                     continue_training = False
                     break
 
-                split_kl = _split_diag_gaussian_kl(tgt_dist, online_dist)
+                split_kl = _split_diag_gaussian_kl(online_dist, tgt_dist)
                 kl_split_available.append(float(split_kl is not None))
                 if split_kl is not None:
                     kl_mean_vec, kl_std_vec = split_kl
