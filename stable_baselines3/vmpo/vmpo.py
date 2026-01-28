@@ -157,7 +157,7 @@ class VMPO(OnPolicyAlgorithm):
         clip_range: Union[float, Schedule] = 0.2,
         clip_range_vf: Union[None, float, Schedule] = None,
         normalize_advantage: bool = True,
-        ent_coef: float = 0.0,
+        ent_coef: float = 0.01,
         vf_coef: float = 0.5,
         max_grad_norm: float = 0.5,
         use_sde: bool = False,
@@ -495,6 +495,11 @@ class VMPO(OnPolicyAlgorithm):
                 log_w = advantages_estep_mb / eta_fixed - logsumexp_all_fixed
                 log_w = log_w.clamp(min=-50.0, max=50.0)
                 weights_mb = th.exp(log_w) * mask_mb
+
+                # Renormalize per minibatch to keep gradient scale stable
+                w = weights_mb.detach()
+                w_sum = w.sum().clamp_min(1e-12)
+                weights_mb = weights_mb / w_sum
 
                 policy_loss = -(weights_mb * log_prob).sum()
                 pg_losses.append(policy_loss.item())
