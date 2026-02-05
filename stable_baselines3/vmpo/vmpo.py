@@ -409,34 +409,32 @@ class VMPO(OnPolicyAlgorithm):
         critic_grad_norms: list[np.ndarray] = []
         batch_advantages = []
         batch_norm_advantages = []
-        continue_training = True
 
         # --- Precompute advantages/top-k/weights once per update ---
         advantages_all = th.as_tensor(self.rollout_buffer.advantages, device=self.device).flatten()
-        advantages_estep_all = advantages_all
 
         # --- Normalize advantages ---
         adv_mean_t: Optional[th.Tensor] = None
         adv_std_t: Optional[th.Tensor] = None
-        if self.normalize_advantage and advantages_estep_all.numel() > 1:
+        if self.normalize_advantage and advantages_all.numel() > 1:
             if self.normalize_advantage_mean:
-                adv_mean_t = advantages_estep_all.mean()
-                advantages_estep_all = advantages_estep_all - adv_mean_t
+                adv_mean_t = advantages_all.mean()
+                advantages_all = advantages_all - adv_mean_t
             if self.normalize_advantage_std:
-                adv_std_t = advantages_estep_all.std(unbiased=False) + 1e-8
-                advantages_estep_all = advantages_estep_all / adv_std_t
+                adv_std_t = advantages_all.std(unbiased=False) + 1e-8
+                advantages_all = advantages_all / adv_std_t
         # Defensive: remove NaN/inf and clamp extremes to prevent overflow in exp
-        advantages_estep_all = th.nan_to_num(advantages_estep_all, nan=0.0, posinf=0.0, neginf=0.0)
-        advantages_estep_all = advantages_estep_all.clamp(min=-100.0, max=100.0)
-        batch_norm_advantages.append(advantages_estep_all.detach().cpu().numpy())
+        advantages_all = th.nan_to_num(advantages_all, nan=0.0, posinf=0.0, neginf=0.0)
+        advantages_all = advantages_all.clamp(min=-100.0, max=100.0)
+        batch_norm_advantages.append(advantages_all.detach().cpu().numpy())
 
-        total_samples = int(advantages_estep_all.shape[0])
+        total_samples = int(advantages_all.shape[0])
         k = max(1, int(self.top_adv_fraction * total_samples))
 
-        sel_adv, _ = th.topk(advantages_estep_all, k)
+        sel_adv, _ = th.topk(advantages_all, k)
         adv_threshold = sel_adv.min()
-        mask_all = advantages_estep_all >= adv_threshold
-        selected_adv = advantages_estep_all[mask_all]
+        mask_all = advantages_all >= adv_threshold
+        selected_adv = advantages_all[mask_all]
         k_eff = selected_adv.numel()
         selected_adv_detached = selected_adv.detach()
 
@@ -461,7 +459,12 @@ class VMPO(OnPolicyAlgorithm):
         # Freeze eta for the whole policy update (all epochs in this iteration)
         eta_fixed = (F.softplus(self.policy.vmpo_log_eta) + 1e-8).detach()  # type: ignore[attr-defined]
         eta_fixed = eta_fixed.clamp_min(1e-4)
-        logsumexp_all_fixed = th.logsumexp(selected_adv_detached / eta_fixed, dim=0)
+
+        # --- Compute psi per state (detached, aligned with rollout buffer order) ---
+        psi_all = th.zeros_like(advantages_all)
+        psi_all[mask_all] = th.exp(selected_adv_detached / eta_fixed)
+        psi_all = psi_all / psi_all.sum().clamp_min(1e-8)
+        psi_all = psi_all.detach()
 
         for rollout_data in self.rollout_buffer.get(self.batch_size):
             actions = rollout_data.actions
@@ -475,28 +478,15 @@ class VMPO(OnPolicyAlgorithm):
             advantages = rollout_data.advantages
             batch_advantages.append(advantages.detach().cpu().numpy())
 
-            advantages_estep_mb = advantages
-            # --- Normalize advantages ---
-            if self.normalize_advantage and advantages_estep_mb.numel() > 1:
-                if self.normalize_advantage_mean and adv_mean_t is not None:
-                    advantages_estep_mb = advantages_estep_mb - adv_mean_t
-                if self.normalize_advantage_std and adv_std_t is not None:
-                    advantages_estep_mb = advantages_estep_mb / adv_std_t
-            advantages_estep_mb = advantages_estep_mb * self.advantage_multiplier
-            advantages_estep_mb = th.nan_to_num(advantages_estep_mb, nan=0.0, posinf=0.0, neginf=0.0)
-            advantages_estep_mb = advantages_estep_mb.clamp(min=-100.0, max=100.0)
+            # --- Index state-level psi for this minibatch ---
+            indices_t = th.as_tensor(rollout_data.indices, device=self.device, dtype=th.long)
+            psi_mb = psi_all[indices_t]
 
-            mask_mb = advantages_estep_mb >= adv_threshold
-            log_w = advantages_estep_mb / eta_fixed - logsumexp_all_fixed
-            log_w = log_w.clamp(min=-50.0, max=50.0)
-            weights_mb = th.exp(log_w) * mask_mb
+            # --- State-weighted entropy expectation (analytic entropy required) ---
+            if entropy is None:
+                raise RuntimeError("State-level V-MPO requires analytic entropy")
 
-            # Renormalize per minibatch to keep gradient scale stable
-            w = weights_mb.detach()
-            w_sum = w.sum().clamp_min(1e-12)
-            weights_mb = weights_mb / w_sum
-
-            policy_loss = -(weights_mb * log_prob).sum()
+            policy_loss = -(psi_mb * entropy).sum()
             pg_losses.append(policy_loss.item())
 
             # --- V-MPO KL: state-averaged distribution KL (use reverse KL: KL(new || old)) ---
@@ -505,17 +495,17 @@ class VMPO(OnPolicyAlgorithm):
             online_dist = self.policy.get_distribution(rollout_data.observations)  # new
 
             # want KL(new || old)
-            kl_vec = _analytic_kl_sb3(online_dist, tgt_dist)  # [B]
-            kl = kl_vec.mean()
+            kl_vec = _analytic_kl_sb3(tgt_dist, online_dist)  # [B]
+            kl = (psi_mb * kl_vec).sum()
             kls.append(kl.detach().cpu().item())
             approx_kl_divs.append(kl.detach().cpu().item())
 
-            split_kl = _split_diag_gaussian_kl(online_dist, tgt_dist)
+            split_kl = _split_diag_gaussian_kl(tgt_dist, online_dist)
             kl_split_available.append(float(split_kl is not None))
             if split_kl is not None:
                 kl_mean_vec, kl_std_vec = split_kl
-                kl_mean = kl_mean_vec.mean()
-                kl_std = kl_std_vec.mean()
+                kl_mean = (psi_mb * kl_mean_vec).sum()
+                kl_std = (psi_mb * kl_std_vec).sum()
 
                 kl_means.append(kl_mean.detach().cpu().item())
                 kl_stds.append(kl_std.detach().cpu().item())
@@ -541,15 +531,12 @@ class VMPO(OnPolicyAlgorithm):
             # kl_penalty = alpha.detach() * kl
 
             # Entropy loss (optional)
-            if entropy is None:
-                entropy_loss = -th.mean(-log_prob)
-            else:
-                entropy_loss = -th.mean(entropy)
+            entropy_loss = -th.mean(entropy)
             entropy_losses.append(entropy_loss.item())
 
             # Track weight entropy (diagnostic)
             with th.no_grad():
-                w = weights_mb
+                w = psi_mb
                 w_sum = w.sum().clamp_min(1e-12)
                 p = w / w_sum
                 w_ent = -(p * th.log(p.clamp_min(1e-12))).sum()
