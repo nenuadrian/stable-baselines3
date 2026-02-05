@@ -466,6 +466,11 @@ class VMPO(OnPolicyAlgorithm):
         psi_all = psi_all / psi_all.sum().clamp_min(1e-8)
         psi_all = psi_all.detach()
 
+        # Store psi alongside the rollout buffer so sampling preserves alignment
+        psi_buffer = psi_all.reshape(self.rollout_buffer.buffer_size, self.rollout_buffer.n_envs)
+        self.rollout_buffer.psi = psi_buffer.cpu().numpy()
+        self.rollout_buffer.generator_ready = False
+
         for rollout_data in self.rollout_buffer.get(self.batch_size):
             actions = rollout_data.actions
             if isinstance(self.action_space, spaces.Discrete):
@@ -479,8 +484,9 @@ class VMPO(OnPolicyAlgorithm):
             batch_advantages.append(advantages.detach().cpu().numpy())
 
             # --- Index state-level psi for this minibatch ---
-            indices_t = th.as_tensor(rollout_data.indices, device=self.device, dtype=th.long)
-            psi_mb = psi_all[indices_t]
+            psi_mb = rollout_data.psi
+            if psi_mb is None:
+                raise RuntimeError("State-level V-MPO requires psi to be present in rollout samples")
 
             # --- State-weighted entropy expectation (analytic entropy required) ---
             if entropy is None:

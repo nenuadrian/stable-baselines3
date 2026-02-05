@@ -397,6 +397,7 @@ class RolloutBuffer(BaseBuffer):
         self.values = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.log_probs = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.advantages = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.psi: Optional[np.ndarray] = None
         self.generator_ready = False
         super().reset()
 
@@ -492,6 +493,9 @@ class RolloutBuffer(BaseBuffer):
                 "returns",
             ]
 
+            if getattr(self, "psi", None) is not None:
+                _tensor_names.append("psi")
+
             for tensor in _tensor_names:
                 self.__dict__[tensor] = self.swap_and_flatten(self.__dict__[tensor])
             self.generator_ready = True
@@ -519,7 +523,11 @@ class RolloutBuffer(BaseBuffer):
             self.advantages[batch_inds].flatten(),
             self.returns[batch_inds].flatten(),
         )
-        return RolloutBufferSamples(*tuple(map(self.to_torch, data)))
+        tensor_data = [self.to_torch(arr) for arr in data]
+        if self.psi is not None:
+            tensor_data.append(self.to_torch(self.psi[batch_inds].flatten()))
+
+        return RolloutBufferSamples(*tensor_data)
 
 
 class DictReplayBuffer(ReplayBuffer):
@@ -756,6 +764,7 @@ class DictRolloutBuffer(RolloutBuffer):
         self.values = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.log_probs = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.advantages = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.psi: Optional[np.ndarray] = None
         self.generator_ready = False
         super(RolloutBuffer, self).reset()
 
@@ -815,6 +824,9 @@ class DictRolloutBuffer(RolloutBuffer):
 
             _tensor_names = ["actions", "values", "log_probs", "advantages", "returns"]
 
+            if getattr(self, "psi", None) is not None:
+                _tensor_names.append("psi")
+
             for tensor in _tensor_names:
                 self.__dict__[tensor] = self.swap_and_flatten(self.__dict__[tensor])
             self.generator_ready = True
@@ -833,15 +845,20 @@ class DictRolloutBuffer(RolloutBuffer):
         batch_inds: np.ndarray,
         env: Optional[VecNormalize] = None,
     ) -> DictRolloutBufferSamples:
-        return DictRolloutBufferSamples(
-            observations={key: self.to_torch(obs[batch_inds]) for (key, obs) in self.observations.items()},
+        samples_kwargs = {
+            "observations": {key: self.to_torch(obs[batch_inds]) for (key, obs) in self.observations.items()},
             # Cast to float32 (backward compatible), this would lead to RuntimeError for MultiBinary space
-            actions=self.to_torch(self.actions[batch_inds].astype(np.float32, copy=False)),
-            old_values=self.to_torch(self.values[batch_inds].flatten()),
-            old_log_prob=self.to_torch(self.log_probs[batch_inds].flatten()),
-            advantages=self.to_torch(self.advantages[batch_inds].flatten()),
-            returns=self.to_torch(self.returns[batch_inds].flatten()),
-        )
+            "actions": self.to_torch(self.actions[batch_inds].astype(np.float32, copy=False)),
+            "old_values": self.to_torch(self.values[batch_inds].flatten()),
+            "old_log_prob": self.to_torch(self.log_probs[batch_inds].flatten()),
+            "advantages": self.to_torch(self.advantages[batch_inds].flatten()),
+            "returns": self.to_torch(self.returns[batch_inds].flatten()),
+        }
+
+        if self.psi is not None:
+            samples_kwargs["psi"] = self.to_torch(self.psi[batch_inds].flatten())
+
+        return DictRolloutBufferSamples(**samples_kwargs)
 
 
 class NStepReplayBuffer(ReplayBuffer):
