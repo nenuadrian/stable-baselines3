@@ -99,7 +99,6 @@ class VMPO(OnPolicyAlgorithm):
         NOTE: n_steps * n_envs must be greater than 1 (because of the advantage normalization)
         See https://github.com/pytorch/pytorch/issues/29372
     :param batch_size: Minibatch size
-    :param n_epochs: Number of epoch when optimizing the surrogate loss
     :param gamma: Discount factor
     :param gae_lambda: Factor for trade-off of bias vs variance for Generalized Advantage Estimator
     :param clip_range: Clipping parameter, it can be a function of the current progress
@@ -151,7 +150,6 @@ class VMPO(OnPolicyAlgorithm):
         learning_rate: Union[float, Schedule] = 3e-4,
         n_steps: int = 2048,
         batch_size: int = 64,
-        n_epochs: int = 10,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
         clip_range: Union[float, Schedule] = 0.2,
@@ -246,7 +244,6 @@ class VMPO(OnPolicyAlgorithm):
         self.normalize_advantage_mean = normalize_advantage_mean
         self.normalize_advantage_std = normalize_advantage_std
         self.batch_size = batch_size
-        self.n_epochs = n_epochs
         self.clip_range = clip_range
         self.clip_range_vf = clip_range_vf
         self.normalize_advantage = normalize_advantage
@@ -466,171 +463,163 @@ class VMPO(OnPolicyAlgorithm):
         eta_fixed = eta_fixed.clamp_min(1e-4)
         logsumexp_all_fixed = th.logsumexp(selected_adv_detached / eta_fixed, dim=0)
 
-        # train for n_epochs epochs
-        for epoch in range(self.n_epochs):
-            for rollout_data in self.rollout_buffer.get(self.batch_size):
-                actions = rollout_data.actions
-                if isinstance(self.action_space, spaces.Discrete):
-                    actions = rollout_data.actions.long().flatten()
+        for rollout_data in self.rollout_buffer.get(self.batch_size):
+            actions = rollout_data.actions
+            if isinstance(self.action_space, spaces.Discrete):
+                actions = rollout_data.actions.long().flatten()
 
-                values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
-                values = values.flatten()
-                log_prob = log_prob.flatten()
+            values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
+            values = values.flatten()
+            log_prob = log_prob.flatten()
 
-                advantages = rollout_data.advantages
-                batch_advantages.append(advantages.detach().cpu().numpy())
+            advantages = rollout_data.advantages
+            batch_advantages.append(advantages.detach().cpu().numpy())
 
-                advantages_estep_mb = advantages
-                # --- Normalize advantages ---
-                if self.normalize_advantage and advantages_estep_mb.numel() > 1:
-                    if self.normalize_advantage_mean and adv_mean_t is not None:
-                        advantages_estep_mb = advantages_estep_mb - adv_mean_t
-                    if self.normalize_advantage_std and adv_std_t is not None:
-                        advantages_estep_mb = advantages_estep_mb / adv_std_t
-                advantages_estep_mb = advantages_estep_mb * self.advantage_multiplier
-                advantages_estep_mb = th.nan_to_num(advantages_estep_mb, nan=0.0, posinf=0.0, neginf=0.0)
-                advantages_estep_mb = advantages_estep_mb.clamp(min=-100.0, max=100.0)
+            advantages_estep_mb = advantages
+            # --- Normalize advantages ---
+            if self.normalize_advantage and advantages_estep_mb.numel() > 1:
+                if self.normalize_advantage_mean and adv_mean_t is not None:
+                    advantages_estep_mb = advantages_estep_mb - adv_mean_t
+                if self.normalize_advantage_std and adv_std_t is not None:
+                    advantages_estep_mb = advantages_estep_mb / adv_std_t
+            advantages_estep_mb = advantages_estep_mb * self.advantage_multiplier
+            advantages_estep_mb = th.nan_to_num(advantages_estep_mb, nan=0.0, posinf=0.0, neginf=0.0)
+            advantages_estep_mb = advantages_estep_mb.clamp(min=-100.0, max=100.0)
 
-                mask_mb = advantages_estep_mb >= adv_threshold
-                log_w = advantages_estep_mb / eta_fixed - logsumexp_all_fixed
-                log_w = log_w.clamp(min=-50.0, max=50.0)
-                weights_mb = th.exp(log_w) * mask_mb
+            mask_mb = advantages_estep_mb >= adv_threshold
+            log_w = advantages_estep_mb / eta_fixed - logsumexp_all_fixed
+            log_w = log_w.clamp(min=-50.0, max=50.0)
+            weights_mb = th.exp(log_w) * mask_mb
 
-                # Renormalize per minibatch to keep gradient scale stable
-                w = weights_mb.detach()
+            # Renormalize per minibatch to keep gradient scale stable
+            w = weights_mb.detach()
+            w_sum = w.sum().clamp_min(1e-12)
+            weights_mb = weights_mb / w_sum
+
+            policy_loss = -(weights_mb * log_prob).sum()
+            pg_losses.append(policy_loss.item())
+
+            # --- V-MPO KL: state-averaged distribution KL (use reverse KL: KL(new || old)) ---
+            with th.no_grad():
+                tgt_dist = self.target_policy.get_distribution(rollout_data.observations)  # old
+            online_dist = self.policy.get_distribution(rollout_data.observations)  # new
+
+            # want KL(new || old)
+            kl_vec = _analytic_kl_sb3(online_dist, tgt_dist)  # [B]
+            kl = kl_vec.mean()
+            kls.append(kl.detach().cpu().item())
+            approx_kl_divs.append(kl.detach().cpu().item())
+
+            split_kl = _split_diag_gaussian_kl(online_dist, tgt_dist)
+            kl_split_available.append(float(split_kl is not None))
+            if split_kl is not None:
+                kl_mean_vec, kl_std_vec = split_kl
+                kl_mean = kl_mean_vec.mean()
+                kl_std = kl_std_vec.mean()
+
+                kl_means.append(kl_mean.detach().cpu().item())
+                kl_stds.append(kl_std.detach().cpu().item())
+
+                alpha_m = F.softplus(self.policy.vmpo_log_alpha_mean) + 1e-8  # type: ignore[attr-defined]
+                alpha_s = F.softplus(self.policy.vmpo_log_alpha_std) + 1e-8  # type: ignore[attr-defined]
+
+                alpha_m_dual = alpha_m * (kl_mean.detach() - self.epsilon_alpha_mean)
+                alpha_s_dual = alpha_s * (kl_std.detach() - self.epsilon_alpha_std)
+                alpha_dual_mean.append(alpha_m_dual.item())
+                alpha_dual_std.append(alpha_s_dual.item())
+                alpha_losses.append((alpha_m_dual + alpha_s_dual).item())
+                kl_penalty = alpha_m.detach() * kl_mean + alpha_s.detach() * kl_std
+            else:
+                alpha = F.softplus(self.policy.vmpo_log_alpha) + 1e-8  # type: ignore[attr-defined]
+                alpha_dual = alpha * (kl.detach() - self.epsilon_alpha)
+                alpha_losses.append(alpha_dual.item())
+                kl_penalty = alpha.detach() * kl
+            # --- V-MPO KL constraint via alpha (Lagrange multiplier) ---
+            # alpha = F.softplus(self.policy.vmpo_log_alpha) + 1e-8
+            # alpha_dual = alpha * (kl.detach() - self.epsilon_alpha)
+            # alpha_losses.append(alpha_dual.item())
+            # kl_penalty = alpha.detach() * kl
+
+            # Entropy loss (optional)
+            if entropy is None:
+                entropy_loss = -th.mean(-log_prob)
+            else:
+                entropy_loss = -th.mean(entropy)
+            entropy_losses.append(entropy_loss.item())
+
+            # Track weight entropy (diagnostic)
+            with th.no_grad():
+                w = weights_mb
                 w_sum = w.sum().clamp_min(1e-12)
-                weights_mb = weights_mb / w_sum
+                p = w / w_sum
+                w_ent = -(p * th.log(p.clamp_min(1e-12))).sum()
+                weight_entropies.append(w_ent.cpu().item())
+                weight_ess.append(th.exp(w_ent).cpu().item())
 
-                policy_loss = -(weights_mb * log_prob).sum()
-                pg_losses.append(policy_loss.item())
+            # Critic loss
+            if self.clip_range_vf is None:
+                values_pred = values
+            else:
+                clip_range_vf = self.clip_range_vf(self._current_progress_remaining)  # type: ignore[operator]
+                values_pred = rollout_data.old_values + th.clamp(
+                    values - rollout_data.old_values, -clip_range_vf, clip_range_vf
+                )
 
-                # --- V-MPO KL: state-averaged distribution KL (use reverse KL: KL(new || old)) ---
-                with th.no_grad():
-                    tgt_dist = self.target_policy.get_distribution(rollout_data.observations)  # old
-                online_dist = self.policy.get_distribution(rollout_data.observations)  # new
+            value_loss = F.mse_loss(rollout_data.returns, values_pred)
+            value_losses.append(value_loss.item())
 
-                # want KL(new || old)
-                kl_vec = _analytic_kl_sb3(online_dist, tgt_dist)  # [B]
-                kl = kl_vec.mean()
-                kls.append(kl.detach().cpu().item())
-                approx_kl_divs.append(kl.detach().cpu().item())
+            actor_total_loss = policy_loss + self.ent_coef * entropy_loss + kl_penalty
+            critic_total_loss = self.vf_coef * value_loss
+            total_loss = actor_total_loss + critic_total_loss
 
-                if self.target_kl is not None and kl > 1.5 * self.target_kl:
-                    continue_training = False
-                    break
+            # Optimize
+            if self.separate_optimizers:
+                assert self.actor_optimizer is not None and self.critic_optimizer is not None
+                assert self._actor_params is not None and self._critic_params is not None
 
-                split_kl = _split_diag_gaussian_kl(online_dist, tgt_dist)
-                kl_split_available.append(float(split_kl is not None))
+                self._update_learning_rate(self.actor_optimizer)
+                self._update_learning_rate(self.critic_optimizer)
+
+                self.actor_optimizer.zero_grad()
+                self.critic_optimizer.zero_grad()
+                total_loss.backward()
+
+                actor_gn = th.nn.utils.clip_grad_norm_(self._actor_params, self.max_grad_norm).detach().cpu().numpy()
+                critic_gn = th.nn.utils.clip_grad_norm_(self._critic_params, self.max_grad_norm).detach().cpu().numpy()
+                actor_grad_norms.append(actor_gn)
+                critic_grad_norms.append(critic_gn)
+
+                # Step both; shared feature extractor (if any) is only in critic optimizer.
+                self.critic_optimizer.step()
+                self.actor_optimizer.step()
+                # self._clamp_log_std()
+            else:
+                self._update_learning_rate(self.policy.optimizer)
+                self.policy.optimizer.zero_grad()
+                total_loss.backward()
+                grad_norms.append(
+                    th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm).detach().cpu().numpy()
+                )
+                self.policy.optimizer.step()
+
+            # Dual ascent step for alpha (separate from primal updates)
+            if self.alpha_optimizer is not None:
+                self._update_learning_rate(self.alpha_optimizer)
+                self.alpha_optimizer.zero_grad()
                 if split_kl is not None:
-                    kl_mean_vec, kl_std_vec = split_kl
-                    kl_mean = kl_mean_vec.mean()
-                    kl_std = kl_std_vec.mean()
-
-                    kl_means.append(kl_mean.detach().cpu().item())
-                    kl_stds.append(kl_std.detach().cpu().item())
-
                     alpha_m = F.softplus(self.policy.vmpo_log_alpha_mean) + 1e-8  # type: ignore[attr-defined]
                     alpha_s = F.softplus(self.policy.vmpo_log_alpha_std) + 1e-8  # type: ignore[attr-defined]
-
-                    alpha_m_dual = alpha_m * (kl_mean.detach() - self.epsilon_alpha_mean)
-                    alpha_s_dual = alpha_s * (kl_std.detach() - self.epsilon_alpha_std)
-                    alpha_dual_mean.append(alpha_m_dual.item())
-                    alpha_dual_std.append(alpha_s_dual.item())
-                    alpha_losses.append((alpha_m_dual + alpha_s_dual).item())
-                    kl_penalty = alpha_m.detach() * kl_mean + alpha_s.detach() * kl_std
+                    alpha_step_loss = -(
+                        alpha_m * (kl_mean.detach() - self.epsilon_alpha_mean)
+                        + alpha_s * (kl_std.detach() - self.epsilon_alpha_std)
+                    )
                 else:
                     alpha = F.softplus(self.policy.vmpo_log_alpha) + 1e-8  # type: ignore[attr-defined]
-                    alpha_dual = alpha * (kl.detach() - self.epsilon_alpha)
-                    alpha_losses.append(alpha_dual.item())
-                    kl_penalty = alpha.detach() * kl
-                # --- V-MPO KL constraint via alpha (Lagrange multiplier) ---
-                # alpha = F.softplus(self.policy.vmpo_log_alpha) + 1e-8
-                # alpha_dual = alpha * (kl.detach() - self.epsilon_alpha)
-                # alpha_losses.append(alpha_dual.item())
-                # kl_penalty = alpha.detach() * kl
+                    alpha_step_loss = -(alpha * (kl.detach() - self.epsilon_alpha))
+                alpha_step_loss.backward()
+                self.alpha_optimizer.step()
 
-                # Entropy loss (optional)
-                if entropy is None:
-                    entropy_loss = -th.mean(-log_prob)
-                else:
-                    entropy_loss = -th.mean(entropy)
-                entropy_losses.append(entropy_loss.item())
-
-                # Track weight entropy (diagnostic)
-                with th.no_grad():
-                    w = weights_mb
-                    w_sum = w.sum().clamp_min(1e-12)
-                    p = w / w_sum
-                    w_ent = -(p * th.log(p.clamp_min(1e-12))).sum()
-                    weight_entropies.append(w_ent.cpu().item())
-                    weight_ess.append(th.exp(w_ent).cpu().item())
-
-                # Critic loss
-                if self.clip_range_vf is None:
-                    values_pred = values
-                else:
-                    clip_range_vf = self.clip_range_vf(self._current_progress_remaining)  # type: ignore[operator]
-                    values_pred = rollout_data.old_values + th.clamp(
-                        values - rollout_data.old_values, -clip_range_vf, clip_range_vf
-                    )
-
-                value_loss = F.mse_loss(rollout_data.returns, values_pred)
-                value_losses.append(value_loss.item())
-
-                actor_total_loss = policy_loss + self.ent_coef * entropy_loss + kl_penalty
-                critic_total_loss = self.vf_coef * value_loss
-                total_loss = actor_total_loss + critic_total_loss
-
-                # Optimize
-                if self.separate_optimizers:
-                    assert self.actor_optimizer is not None and self.critic_optimizer is not None
-                    assert self._actor_params is not None and self._critic_params is not None
-
-                    self._update_learning_rate(self.actor_optimizer)
-                    self._update_learning_rate(self.critic_optimizer)
-
-                    self.actor_optimizer.zero_grad()
-                    self.critic_optimizer.zero_grad()
-                    total_loss.backward()
-
-                    actor_gn = th.nn.utils.clip_grad_norm_(self._actor_params, self.max_grad_norm).detach().cpu().numpy()
-                    critic_gn = th.nn.utils.clip_grad_norm_(self._critic_params, self.max_grad_norm).detach().cpu().numpy()
-                    actor_grad_norms.append(actor_gn)
-                    critic_grad_norms.append(critic_gn)
-
-                    # Step both; shared feature extractor (if any) is only in critic optimizer.
-                    self.critic_optimizer.step()
-                    self.actor_optimizer.step()
-                    # self._clamp_log_std()
-                else:
-                    self._update_learning_rate(self.policy.optimizer)
-                    self.policy.optimizer.zero_grad()
-                    total_loss.backward()
-                    grad_norms.append(
-                        th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm).detach().cpu().numpy()
-                    )
-                    self.policy.optimizer.step()
-
-                # Dual ascent step for alpha (separate from primal updates)
-                if self.alpha_optimizer is not None:
-                    self._update_learning_rate(self.alpha_optimizer)
-                    self.alpha_optimizer.zero_grad()
-                    if split_kl is not None:
-                        alpha_m = F.softplus(self.policy.vmpo_log_alpha_mean) + 1e-8  # type: ignore[attr-defined]
-                        alpha_s = F.softplus(self.policy.vmpo_log_alpha_std) + 1e-8  # type: ignore[attr-defined]
-                        alpha_step_loss = -(
-                            alpha_m * (kl_mean.detach() - self.epsilon_alpha_mean)
-                            + alpha_s * (kl_std.detach() - self.epsilon_alpha_std)
-                        )
-                    else:
-                        alpha = F.softplus(self.policy.vmpo_log_alpha) + 1e-8  # type: ignore[attr-defined]
-                        alpha_step_loss = -(alpha * (kl.detach() - self.epsilon_alpha))
-                    alpha_step_loss.backward()
-                    self.alpha_optimizer.step()
-
-            self._n_updates += 1
-            if not continue_training:
-                break
+        self._n_updates += 1
 
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
